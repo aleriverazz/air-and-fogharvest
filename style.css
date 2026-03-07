@@ -1,8 +1,10 @@
-/* ═══════════════════════════════════════════
-   FogHarvest v3 · style.css
-   Dark terrain-analysis UI — Syne + DM Mono
-═══════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════
+   FogHarvest v4 · style.css
+   MapTiler 3D terrain + earth.nullschool wind overlay
+   Dark scientific UI — Syne + DM Mono
+═══════════════════════════════════════════════════ */
 
+/* ── Design tokens ── */
 :root {
   --bg:       #080a0e;
   --bg-p:     #0c0f14;
@@ -26,8 +28,10 @@
   --fh: 'Syne', sans-serif;
 }
 
+/* ── Reset ── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* ── Base: html + body must be 100% for map to fill correctly ── */
 html, body {
   width: 100%; height: 100%;
   overflow: hidden;
@@ -37,7 +41,9 @@ html, body {
   font-size: 13px;
 }
 
-/* ── Loader ── */
+/* ════════════════════════════════
+   LOADER
+════════════════════════════════ */
 #loader {
   position: fixed; inset: 0; z-index: 9999;
   background: var(--bg);
@@ -69,20 +75,25 @@ html, body {
 }
 @keyframes ldprog { to { width: 100%; } }
 
-/* ── App ── */
+/* ════════════════════════════════
+   APP SHELL
+════════════════════════════════ */
 #app {
   width: 100vw; height: 100vh;
   display: flex; flex-direction: column; overflow: hidden;
 }
 #app.hidden { display: none; }
 
-/* ── Topbar ── */
+/* ════════════════════════════════
+   TOPBAR
+════════════════════════════════ */
 #topbar {
   height: var(--topbar-h); flex-shrink: 0;
   background: var(--bg-p);
   border-bottom: 1px solid var(--border);
   display: flex; align-items: center; justify-content: space-between;
-  padding: 0 14px; gap: 12px; z-index: 100;
+  padding: 0 14px; gap: 10px; z-index: 200;
+  overflow: visible; /* needed for search dropdown to escape */
 }
 
 .brand {
@@ -97,9 +108,11 @@ html, body {
 .brand-sub { font-size: 10px; color: var(--dim); letter-spacing: .1em; }
 
 .tb-controls {
-  display: flex; align-items: center; gap: 10px; flex-wrap: nowrap;
+  display: flex; align-items: center; gap: 8px; flex-wrap: nowrap;
+  overflow: visible;
 }
 
+/* ── Control group (label + input) ── */
 .ctrl-group {
   display: flex; align-items: center; gap: 5px;
 }
@@ -115,6 +128,7 @@ html, body {
 }
 .ctrl-group select:hover { border-color: var(--acc); }
 
+/* ── Layer buttons ── */
 .layer-btns { display: flex; gap: 4px; }
 .lbtn {
   display: flex; align-items: center; gap: 4px;
@@ -125,8 +139,9 @@ html, body {
 }
 .lbtn svg { width: 13px; height: 13px; }
 .lbtn.active { border-color: var(--acc); color: var(--acc); background: rgba(0,200,255,.08); }
-.lbtn:hover { border-color: var(--acc2); color: var(--acc2); }
+.lbtn:hover  { border-color: var(--acc2); color: var(--acc2); }
 
+/* ── Refresh button ── */
 .btn-refresh {
   display: flex; align-items: center; gap: 5px;
   background: transparent; border: 1px solid var(--acc); color: var(--acc);
@@ -138,6 +153,7 @@ html, body {
 .btn-refresh svg { width: 13px; height: 13px; }
 .btn-refresh:hover { background: var(--acc); color: var(--bg); }
 
+/* ── Icon button ── */
 .btn-icon {
   background: transparent; border: 1px solid var(--bhi); color: var(--dim);
   padding: 4px 7px; border-radius: var(--r); cursor: pointer; flex-shrink: 0;
@@ -146,37 +162,130 @@ html, body {
 .btn-icon svg { width: 15px; height: 15px; }
 .btn-icon:hover { border-color: var(--acc); color: var(--acc); }
 
-/* ── Main ── */
+/* ════════════════════════════════
+   SEARCH BAR (MapTiler Geocoding)
+   ─ Lives in the topbar
+   ─ Dropdown escapes topbar via z-index
+════════════════════════════════ */
+.search-wrap {
+  position: relative;
+  display: flex; align-items: center;
+  background: var(--bg-card);
+  border: 1px solid var(--bhi);
+  border-radius: var(--r);
+  padding: 0 8px;
+  gap: 6px;
+  flex-shrink: 0;
+  width: 200px;
+  transition: border-color .2s, width .2s;
+  z-index: 300; /* dropdown must appear above map */
+}
+.search-wrap:focus-within {
+  border-color: var(--acc);
+  width: 240px;
+}
+.search-icon {
+  width: 12px; height: 12px; color: var(--mute); flex-shrink: 0;
+}
+#searchInput {
+  flex: 1; background: transparent; border: none; outline: none;
+  color: var(--text); font-family: var(--fm); font-size: 11px;
+  padding: 5px 0; min-width: 0;
+}
+#searchInput::placeholder { color: var(--mute); }
+
+.search-clear {
+  background: transparent; border: none; cursor: pointer;
+  color: var(--mute); padding: 2px; display: flex; align-items: center;
+  transition: color .15s; flex-shrink: 0;
+}
+.search-clear svg { width: 10px; height: 10px; }
+.search-clear:hover { color: var(--text); }
+
+/* ── Geocoding results dropdown ── */
+.search-dropdown {
+  position: absolute;
+  top: calc(100% + 4px); left: 0; right: 0;
+  background: var(--bg-p);
+  border: 1px solid var(--bhi);
+  border-radius: var(--r);
+  overflow: hidden;
+  z-index: 400;
+  max-height: 240px; overflow-y: auto;
+  box-shadow: 0 8px 24px rgba(0,0,0,.7);
+  scrollbar-width: thin; scrollbar-color: var(--bhi) transparent;
+}
+.search-dropdown::-webkit-scrollbar { width: 3px; }
+.search-dropdown::-webkit-scrollbar-thumb { background: var(--bhi); }
+
+.search-item {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 8px 12px; cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background .15s;
+}
+.search-item:last-child { border-bottom: none; }
+.search-item:hover { background: rgba(0,200,255,.07); }
+
+.si-name {
+  font-size: 11px; color: var(--text); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.si-place {
+  font-size: 9px; color: var(--mute);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.si-coords {
+  font-size: 8px; color: var(--mute); opacity: .6;
+  font-family: var(--fm);
+}
+
+.search-no-results {
+  padding: 10px 12px;
+  font-size: 10px; color: var(--mute); text-align: center;
+}
+.search-loading {
+  padding: 10px 12px;
+  font-size: 10px; color: var(--dim); text-align: center;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+/* ════════════════════════════════
+   MAIN LAYOUT
+════════════════════════════════ */
 #main {
   flex: 1; min-height: 0;
   display: flex; overflow: hidden;
 }
 
-/* ── Map ── */
+/* ════════════════════════════════
+   MAP AREA
+════════════════════════════════ */
 #map-wrap {
   flex: 1; min-width: 0;
   position: relative; overflow: hidden;
 }
 
+/* The actual map div fills its parent absolutely */
 #map {
   position: absolute; inset: 0;
   width: 100%; height: 100%;
 }
 
-/* Canvases sit ABOVE the map, pointer-events none */
+/* Overlay canvases sit above the map, receive no pointer events */
 #hum-canvas, #wind-canvas {
   position: absolute; inset: 0;
-  pointer-events: none; z-index: 2;
+  pointer-events: none;
 }
-#hum-canvas  { z-index: 2; }
-#wind-canvas { z-index: 3; }
+#hum-canvas  { z-index: 2; }  /* humidity pixel field */
+#wind-canvas { z-index: 3; }  /* wind streamline particles */
 
-/* Mapbox overrides */
+/* ── MapTiler / Mapbox GL control overrides ── */
 .mapboxgl-ctrl-logo { display: none !important; }
-.mapboxgl-ctrl-attrib { font-size: 8px !important; opacity: .35; }
+.mapboxgl-ctrl-attrib { font-size: 8px !important; opacity: .3; }
 .mapboxgl-ctrl-bottom-right { bottom: 6px !important; right: 6px !important; }
 
-/* Status bar */
+/* ── Status indicator ── */
 #status-bar {
   position: absolute; top: 10px; left: 10px; z-index: 10;
   background: rgba(8,10,14,.88); border: 1px solid var(--bhi);
@@ -193,48 +302,49 @@ html, body {
 .st-dot.err { background: var(--danger); animation: none; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
 
-/* Legend */
+/* ── Legend ── */
 #legend {
   position: absolute; bottom: 40px; left: 10px; z-index: 10;
   background: rgba(8,10,14,.9); border: 1px solid var(--bhi);
   backdrop-filter: blur(6px);
   padding: 10px 12px; border-radius: var(--r);
-  min-width: 160px;
+  min-width: 165px;
 }
 .leg-row { display: flex; flex-direction: column; gap: 3px; }
 .leg-title {
-  font-size: 8px; letter-spacing: .18em;
-  color: var(--dim); text-transform: uppercase;
+  font-size: 8px; letter-spacing: .18em; color: var(--dim); text-transform: uppercase;
 }
-/* Wind speed gradient: nullschool style */
+
+/* Wind speed gradient — nullschool/zoom.earth palette */
 .leg-wind-bar {
   height: 5px; border-radius: 3px;
   background: linear-gradient(90deg,
-    #3a007a 0%,    /* calm — dark purple */
-    #1a3aff 18%,   /* 2–4 m/s — deep blue */
-    #00aaff 35%,   /* 5–6 m/s — cyan */
-    #00ffaa 52%,   /* 7–9 m/s — teal-green */
-    #aaff00 68%,   /* 10–12 m/s — yellow-green */
-    #ffcc00 80%,   /* 13–15 m/s — amber */
-    #ff4400 100%   /* 15+ m/s — red */
+    #3a007a 0%,   /* calm — dark purple   */
+    #1a3aff 18%,  /* 2 m/s — deep blue    */
+    #00c8ff 35%,  /* 5 m/s — cyan         */
+    #00ffaa 52%,  /* 8 m/s — teal-green   */
+    #aaff00 68%,  /* 11 m/s— yellow-green */
+    #ffcc00 80%,  /* 14 m/s— amber        */
+    #ff3300 100%  /* 17+ m/s— red         */
   );
 }
 .leg-wind-labels {
   display: flex; justify-content: space-between;
   font-size: 8px; color: var(--mute);
 }
-.leg-unit { color: var(--mute); font-size: 7px; }
+.leg-unit { font-size: 7px; color: var(--mute); }
 .leg-sep { height: 1px; background: var(--border); margin: 7px 0; }
-/* Humidity gradient */
+
+/* Humidity gradient — zoom.earth moisture palette */
 .leg-hum-bar {
   height: 5px; border-radius: 3px;
   background: linear-gradient(90deg,
-    #8B0000 0%,    /* very dry — dark red */
-    #cc3300 20%,   /* dry — red-orange */
-    #ffaa00 40%,   /* moderate — amber */
-    #aadd00 60%,   /* moist — yellow-green */
-    #00ccff 80%,   /* humid — sky blue */
-    #0044ff 100%   /* saturated — deep blue */
+    #8B0000 0%,   /* very dry — dark red    */
+    #cc3300 20%,  /* dry — red-orange       */
+    #ffaa00 40%,  /* moderate — amber       */
+    #aadd00 60%,  /* moist — yellow-green   */
+    #00ccff 80%,  /* humid — sky blue       */
+    #0033cc 100%  /* saturated — deep blue  */
   );
 }
 .leg-hum-labels {
@@ -242,7 +352,7 @@ html, body {
   font-size: 8px; color: var(--mute);
 }
 
-/* Click hint */
+/* ── Click hint pill ── */
 #click-hint {
   position: absolute; bottom: 20px; left: 50%;
   transform: translateX(-50%); z-index: 10;
@@ -256,14 +366,16 @@ html, body {
 #click-hint svg { width: 13px; height: 13px; }
 #click-hint.hidden { opacity: 0; }
 
-/* Compass */
+/* ── Compass rose ── */
 #compass {
   position: absolute; top: 10px; right: 10px; z-index: 10;
   width: 44px; height: 44px; opacity: .55; pointer-events: none;
 }
 #compass svg { width: 100%; height: 100%; }
 
-/* ── Panel ── */
+/* ════════════════════════════════
+   ANALYSIS PANEL
+════════════════════════════════ */
 #panel {
   width: var(--panel-w); flex-shrink: 0;
   background: var(--bg-p);
@@ -281,7 +393,7 @@ html, body {
 #panel-scroll::-webkit-scrollbar { width: 3px; }
 #panel-scroll::-webkit-scrollbar-thumb { background: var(--bhi); border-radius: 2px; }
 
-/* Empty */
+/* ── Empty state ── */
 #p-empty {
   display: flex; flex-direction: column; align-items: center;
   gap: 12px; padding: 36px 12px; text-align: center;
@@ -291,7 +403,7 @@ html, body {
 .p-empty-icon svg { width: 100%; height: 100%; }
 .p-empty-sub { font-size: 10px; color: var(--mute); opacity: .55; }
 
-/* Panel sections */
+/* ── Panel sections ── */
 .ps {
   margin-bottom: 18px;
   animation: fadeup .35s ease both;
@@ -309,7 +421,7 @@ html, body {
   display: flex; align-items: center; gap: 8px;
 }
 
-/* Coord grid */
+/* ── Coordinate grid ── */
 .coord-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
 .crd {
   background: var(--bg-card); border: 1px solid var(--border);
@@ -319,7 +431,7 @@ html, body {
 .crd-k { font-size: 8px; letter-spacing: .14em; color: var(--mute); }
 .crd-v { font-size: 12px; color: var(--acc); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* Score */
+/* ── Feasibility score ring ── */
 .score-wrap { display: flex; align-items: center; gap: 16px; padding: 6px 0; }
 .score-svg { width: 110px; height: 110px; flex-shrink: 0; }
 .score-meta { display: flex; flex-direction: column; gap: 5px; }
@@ -329,17 +441,30 @@ html, body {
 }
 .score-limit { font-size: 9px; color: var(--warn); letter-spacing: .05em; min-height: 12px; }
 
-/* Yield */
+/* ── Water yield ── */
 .yield-box {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: var(--r); padding: 12px 14px;
-  display: flex; align-items: baseline; gap: 6px; margin-bottom: 6px;
+  display: flex; align-items: baseline; gap: 6px; margin-bottom: 8px;
 }
 .yield-n { font-family: var(--fh); font-size: 28px; font-weight: 700; color: var(--acc2); }
 .yield-u { font-size: 10px; color: var(--mute); }
-.yield-note { font-size: 9px; color: var(--dim); line-height: 1.6; }
 
-/* Factors */
+/* ── Yield detail sub-cards (LWC, wind factor, fog hours, efficiency) ── */
+.yield-detail-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-bottom: 7px;
+}
+.yd-item {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 6px 8px;
+}
+.yd-k { font-size: 7.5px; letter-spacing: .12em; color: var(--mute); margin-bottom: 2px; }
+.yd-v { font-size: 12px; color: var(--dim); }
+.yd-u { font-size: 8px; color: var(--mute); margin-left: 2px; }
+
+.yield-note { font-size: 9px; color: var(--mute); line-height: 1.6; }
+
+/* ── Factor items ── */
 .factor-item {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: var(--r); padding: 9px 11px; margin-bottom: 6px;
@@ -351,14 +476,14 @@ html, body {
   font-size: 8px; font-weight: 500; letter-spacing: .12em;
   padding: 2px 6px; border-radius: 3px; text-transform: uppercase;
 }
-.low  { background: rgba(255,68,102,.14); color: var(--hi-low); border: 1px solid rgba(255,68,102,.3); }
-.med  { background: rgba(255,184,48,.12); color: var(--hi-med); border: 1px solid rgba(255,184,48,.3); }
-.high { background: rgba(0,255,170,.09); color: var(--hi-high); border: 1px solid rgba(0,255,170,.24); }
+.low  { background: rgba(255,68,102,.14);  color: var(--hi-low);  border: 1px solid rgba(255,68,102,.3);  }
+.med  { background: rgba(255,184,48,.12);  color: var(--hi-med);  border: 1px solid rgba(255,184,48,.3);  }
+.high { background: rgba(0,255,170,.09);   color: var(--hi-high); border: 1px solid rgba(0,255,170,.24);  }
 .fi-bar { height: 2px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 5px; }
 .fi-bar-fill { height: 100%; border-radius: 2px; transition: width .8s cubic-bezier(.4,0,.2,1); }
 .fi-detail { font-size: 9px; color: var(--mute); }
 
-/* Atmosphere grid */
+/* ── Atmosphere grid ── */
 .atm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
 .atm-item {
   background: var(--bg-card); border: 1px solid var(--border);
@@ -368,10 +493,10 @@ html, body {
 .atm-v { font-size: 13px; }
 .atm-u { font-size: 9px; color: var(--mute); margin-left: 1px; }
 
-/* Chart */
+/* ── Monthly chart ── */
 .chart-box {
   background: var(--bg-card); border: 1px solid var(--border);
-  border-radius: var(--r); padding: 8px; height: 150px; position: relative;
+  border-radius: var(--r); padding: 8px; height: 150px;
 }
 .chart-note { font-size: 8px; color: var(--mute); text-align: center; margin-top: 4px; letter-spacing: .06em; }
 
@@ -381,21 +506,20 @@ html, body {
   color: var(--acc); border-radius: 3px; animation: pulse 1.5s infinite;
 }
 
-/* Export */
+/* ── Export buttons ── */
 .exp-btns { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }
 .exp-btn {
   display: flex; flex-direction: column; align-items: center; gap: 5px;
   background: var(--bg-card); border: 1px solid var(--bhi);
   color: var(--dim); font-family: var(--fm); font-size: 9px;
   letter-spacing: .1em; padding: 9px 4px;
-  border-radius: var(--r); cursor: pointer;
-  transition: all .2s;
+  border-radius: var(--r); cursor: pointer; transition: all .2s;
 }
 .exp-btn svg { width: 16px; height: 16px; }
 .exp-btn:hover { border-color: var(--acc); color: var(--acc); background: rgba(0,200,255,.06); }
 .exp-btn:active { transform: scale(.97); }
 
-/* Panel loading */
+/* ── Panel loading overlay ── */
 #p-loading {
   position: absolute; inset: 0; background: var(--bg-p);
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -408,11 +532,20 @@ html, body {
   border-radius: 50%; animation: spin .7s linear infinite;
 }
 
+/* ── Utility ── */
 .hidden { display: none !important; }
 
+/* ── Responsive ── */
+@media (max-width: 900px) {
+  .brand-sub, .brand-sep { display: none; }
+  .search-wrap { width: 150px; }
+  .search-wrap:focus-within { width: 180px; }
+}
 @media (max-width: 720px) {
   :root { --panel-w: 100vw; }
   #main { flex-direction: column; }
-  #panel { width: 100%; height: 45vh; border-left: none; border-top: 1px solid var(--border); }
-  .brand-sub, .brand-sep { display: none; }
+  #panel {
+    width: 100%; height: 45vh;
+    border-left: none; border-top: 1px solid var(--border);
+  }
 }

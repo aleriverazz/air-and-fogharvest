@@ -5,17 +5,33 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>FogHarvest · Viento &amp; Humedad</title>
 
-  <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet"/>
-  <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+  <!--
+    MAP ENGINE ─ MapTiler SDK v2  (replaces Mapbox GL JS)
+    MapTiler SDK is API-compatible but requires NO Mapbox token.
+    Auth is handled via maptilersdk.config.apiKey in script.js.
+  -->
+  <link  href="https://cdn.maptiler.com/maptiler-sdk-js/v2.0.3/maptiler-sdk.css" rel="stylesheet"/>
+  <script src="https://cdn.maptiler.com/maptiler-sdk-js/v2.0.3/maptiler-sdk.umd.min.js"></script>
+
+  <!-- Turf.js — spatial helpers (coast-distance estimation) -->
   <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <!-- Chart.js — monthly yield bar chart -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+
+  <!-- html2canvas — map screenshot export -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+  <!-- Fonts -->
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@400;700;800&display=swap" rel="stylesheet"/>
+
   <link rel="stylesheet" href="style.css"/>
 </head>
 <body>
 
-<!-- LOADER -->
+<!-- ═══════════════════════════════════════════
+     LOADER
+═══════════════════════════════════════════ -->
 <div id="loader">
   <div class="ld-inner">
     <svg class="ld-icon" viewBox="0 0 64 64" fill="none">
@@ -29,11 +45,15 @@
   </div>
 </div>
 
-<!-- APP -->
+<!-- ═══════════════════════════════════════════
+     APP SHELL
+═══════════════════════════════════════════ -->
 <div id="app" class="hidden">
 
-  <!-- TOPBAR -->
+  <!-- ── TOP BAR ── -->
   <header id="topbar">
+
+    <!-- Brand -->
     <div class="brand">
       <svg viewBox="0 0 22 22" fill="none">
         <path d="M11 2C11 2 5 8 5 13C5 16.3 7.7 19 11 19C14.3 19 17 16.3 17 13C17 8 11 2 11 2Z"
@@ -47,7 +67,25 @@
     </div>
 
     <div class="tb-controls">
-      <!-- Wind altitude -->
+
+      <!-- ══ SEARCH BAR (MapTiler Geocoding API) ══ -->
+      <div class="search-wrap" id="searchWrap">
+        <svg class="search-icon" viewBox="0 0 16 16" fill="none">
+          <circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.3"/>
+          <line x1="10" y1="10" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+        </svg>
+        <input id="searchInput" type="text" placeholder="Buscar lugar…"
+               autocomplete="off" spellcheck="false"/>
+        <button id="searchClear" class="search-clear hidden" title="Limpiar búsqueda">
+          <svg viewBox="0 0 12 12" fill="none">
+            <line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            <line x1="10" y1="2" x2="2" y2="10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <div id="searchDropdown" class="search-dropdown hidden"></div>
+      </div>
+
+      <!-- Wind altitude selector -->
       <div class="ctrl-group">
         <span class="ctrl-label">ALTITUD</span>
         <select id="selAlt">
@@ -57,7 +95,7 @@
         </select>
       </div>
 
-      <!-- Month -->
+      <!-- Historical month selector -->
       <div class="ctrl-group">
         <span class="ctrl-label">MES</span>
         <select id="selMonth">
@@ -71,7 +109,7 @@
         </select>
       </div>
 
-      <!-- Layer toggles -->
+      <!-- Layer visibility toggles -->
       <div class="ctrl-group">
         <span class="ctrl-label">CAPAS</span>
         <div class="layer-btns">
@@ -100,7 +138,7 @@
         ACTUALIZAR
       </button>
 
-      <button id="btnPanel" class="btn-icon" title="Panel">
+      <button id="btnPanel" class="btn-icon" title="Mostrar/ocultar panel">
         <svg viewBox="0 0 18 18" fill="none">
           <rect x="2" y="2" width="14" height="14" rx="2" stroke="currentColor" stroke-width="1.3"/>
           <line x1="12" y1="2" x2="12" y2="16" stroke="currentColor" stroke-width="1.3"/>
@@ -109,27 +147,30 @@
     </div>
   </header>
 
-  <!-- MAIN -->
+  <!-- ── MAIN ── -->
   <main id="main">
 
-    <!-- MAP -->
+    <!-- MAP WRAP -->
     <div id="map-wrap">
-      <canvas id="wind-canvas"></canvas>
       <canvas id="hum-canvas"></canvas>
+      <canvas id="wind-canvas"></canvas>
       <div id="map"></div>
 
-      <!-- Status bar -->
+      <!-- Status indicator -->
       <div id="status-bar">
         <span class="st-dot" id="stDot"></span>
         <span id="stText">CARGANDO DATOS DE VIENTO…</span>
       </div>
 
-      <!-- Legend -->
+      <!-- Color legend -->
       <div id="legend">
         <div class="leg-row">
           <span class="leg-title">VIENTO</span>
           <div class="leg-wind-bar"></div>
-          <div class="leg-wind-labels"><span>0</span><span>5</span><span>10</span><span>15+</span><span class="leg-unit">m/s</span></div>
+          <div class="leg-wind-labels">
+            <span>0</span><span>5</span><span>10</span><span>15+</span>
+            <span class="leg-unit">m/s</span>
+          </div>
         </div>
         <div class="leg-sep"></div>
         <div class="leg-row">
@@ -141,27 +182,31 @@
 
       <!-- Click hint -->
       <div id="click-hint">
-        <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.2"/><circle cx="8" cy="8" r="2" fill="currentColor"/></svg>
+        <svg viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.2"/>
+          <circle cx="8" cy="8" r="2" fill="currentColor"/>
+        </svg>
         Clic en el terreno para analizar
       </div>
 
-      <!-- Compass -->
+      <!-- Compass rose -->
       <div id="compass">
         <svg viewBox="0 0 44 44" fill="none">
           <circle cx="22" cy="22" r="20" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
           <path d="M22 5 L26 22 L22 20 L18 22 Z" fill="#e84444"/>
           <path d="M22 39 L18 22 L22 24 L26 22 Z" fill="rgba(255,255,255,0.45)"/>
           <circle cx="22" cy="22" r="2.5" fill="white"/>
-          <text x="22" y="3.5" text-anchor="middle" fill="rgba(255,255,255,0.6)" font-size="4.5" font-family="DM Mono">N</text>
+          <text x="22" y="3.5" text-anchor="middle" fill="rgba(255,255,255,0.6)"
+                font-size="4.5" font-family="DM Mono">N</text>
         </svg>
       </div>
     </div>
 
-    <!-- ANALYSIS PANEL -->
+    <!-- ══ ANALYSIS PANEL ══ -->
     <aside id="panel">
       <div id="panel-scroll">
 
-        <!-- Empty -->
+        <!-- Empty state -->
         <div id="p-empty">
           <div class="p-empty-icon">
             <svg viewBox="0 0 72 72" fill="none">
@@ -177,7 +222,7 @@
         <!-- Results -->
         <div id="p-results" class="hidden">
 
-          <!-- Location -->
+          <!-- §1 Location -->
           <section class="ps">
             <div class="ps-label">UBICACIÓN</div>
             <div class="coord-grid">
@@ -188,7 +233,7 @@
             </div>
           </section>
 
-          <!-- Score -->
+          <!-- §2 Score ring -->
           <section class="ps">
             <div class="ps-label">FACTIBILIDAD NIEBLA</div>
             <div class="score-wrap">
@@ -215,29 +260,30 @@
             </div>
           </section>
 
-          <!-- Water Yield -->
+          <!-- §3 Water yield -->
           <section class="ps">
             <div class="ps-label">RENDIMIENTO HÍDRICO</div>
             <div class="yield-box">
               <span class="yield-n" id="yieldVal">—</span>
               <span class="yield-u">L/m²/día</span>
             </div>
+            <div class="yield-detail-grid" id="yieldDetails"></div>
             <div class="yield-note" id="yieldNote"></div>
           </section>
 
-          <!-- Factors -->
+          <!-- §4 Factor breakdown -->
           <section class="ps">
             <div class="ps-label">FACTORES DE ANÁLISIS</div>
             <div id="factorList"></div>
           </section>
 
-          <!-- Atmosphere -->
+          <!-- §5 Atmospheric data -->
           <section class="ps">
             <div class="ps-label">DATOS ATMOSFÉRICOS</div>
             <div class="atm-grid" id="atmGrid"></div>
           </section>
 
-          <!-- Monthly chart -->
+          <!-- §6 Monthly chart -->
           <section class="ps">
             <div class="ps-label">
               POTENCIAL MENSUAL
@@ -247,7 +293,7 @@
             <div class="chart-note">L/m²/día estimado · año anterior</div>
           </section>
 
-          <!-- Export -->
+          <!-- §7 Export -->
           <section class="ps">
             <div class="ps-label">EXPORTAR</div>
             <div class="exp-btns">
@@ -268,17 +314,17 @@
 
         </div><!-- /p-results -->
 
-        <!-- Panel loading -->
+        <!-- Loading overlay -->
         <div id="p-loading" class="hidden">
           <div class="p-spin"></div>
           <span>Obteniendo datos…</span>
         </div>
 
-      </div>
+      </div><!-- /panel-scroll -->
     </aside>
 
   </main>
-</div>
+</div><!-- /app -->
 
 <script src="script.js"></script>
 </body>
