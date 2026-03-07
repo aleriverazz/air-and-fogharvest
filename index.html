@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>FogHarvest · Viento &amp; Humedad</title>
+
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet"/>
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@400;700;800&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+
+<!-- LOADER -->
+<div id="loader">
+  <div class="ld-inner">
+    <svg class="ld-icon" viewBox="0 0 64 64" fill="none">
+      <circle cx="32" cy="32" r="30" stroke="currentColor" stroke-width="1" stroke-dasharray="5 4"/>
+      <path d="M32 10C32 10 18 24 18 34C18 42 24 48 32 48C40 48 46 42 46 34C46 24 32 10 32 10Z"
+            stroke="currentColor" stroke-width="1.4" fill="none"/>
+      <circle cx="32" cy="34" r="3.5" fill="currentColor"/>
+    </svg>
+    <span class="ld-label">INICIALIZANDO TERRENO</span>
+    <div class="ld-bar"><div class="ld-fill"></div></div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app" class="hidden">
+
+  <!-- TOPBAR -->
+  <header id="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 22 22" fill="none">
+        <path d="M11 2C11 2 5 8 5 13C5 16.3 7.7 19 11 19C14.3 19 17 16.3 17 13C17 8 11 2 11 2Z"
+              stroke="currentColor" stroke-width="1.4"/>
+        <path d="M8 11C8 11 9.5 9 11 9C12.5 9 14 11 14 11"
+              stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      </svg>
+      <span class="brand-name">FogHarvest</span>
+      <span class="brand-sep">|</span>
+      <span class="brand-sub">Viento &amp; Humedad · Terrain Scale</span>
+    </div>
+
+    <div class="tb-controls">
+      <!-- Wind altitude -->
+      <div class="ctrl-group">
+        <span class="ctrl-label">ALTITUD</span>
+        <select id="selAlt">
+          <option value="10m">10 m</option>
+          <option value="80m" selected>80 m</option>
+          <option value="120m">120 m</option>
+        </select>
+      </div>
+
+      <!-- Month -->
+      <div class="ctrl-group">
+        <span class="ctrl-label">MES</span>
+        <select id="selMonth">
+          <option value="current" selected>Actual</option>
+          <option value="1">Enero</option><option value="2">Febrero</option>
+          <option value="3">Marzo</option><option value="4">Abril</option>
+          <option value="5">Mayo</option><option value="6">Junio</option>
+          <option value="7">Julio</option><option value="8">Agosto</option>
+          <option value="9">Septiembre</option><option value="10">Octubre</option>
+          <option value="11">Noviembre</option><option value="12">Diciembre</option>
+        </select>
+      </div>
+
+      <!-- Layer toggles -->
+      <div class="ctrl-group">
+        <span class="ctrl-label">CAPAS</span>
+        <div class="layer-btns">
+          <button class="lbtn active" id="btnWind" title="Viento">
+            <svg viewBox="0 0 18 18" fill="none">
+              <path d="M2 9h9M11 6c0 0 4 0 4 3s-4 3-4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              <path d="M2 6h6M8 4c0 0 2.5 0 2.5 2S8 8 8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+            </svg>
+            VIENTO
+          </button>
+          <button class="lbtn active" id="btnHum" title="Humedad">
+            <svg viewBox="0 0 18 18" fill="none">
+              <path d="M9 3C9 3 4 9 4 12C4 14.8 6.2 17 9 17C11.8 17 14 14.8 14 12C14 9 9 3 9 3Z"
+                    stroke="currentColor" stroke-width="1.4" fill="none"/>
+            </svg>
+            HUMEDAD
+          </button>
+        </div>
+      </div>
+
+      <button id="btnRefresh" class="btn-refresh">
+        <svg viewBox="0 0 18 18" fill="none">
+          <path d="M15 7A6 6 0 1 0 14 13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          <path d="M15 3.5V7H11.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        ACTUALIZAR
+      </button>
+
+      <button id="btnPanel" class="btn-icon" title="Panel">
+        <svg viewBox="0 0 18 18" fill="none">
+          <rect x="2" y="2" width="14" height="14" rx="2" stroke="currentColor" stroke-width="1.3"/>
+          <line x1="12" y1="2" x2="12" y2="16" stroke="currentColor" stroke-width="1.3"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- MAIN -->
+  <main id="main">
+
+    <!-- MAP -->
+    <div id="map-wrap">
+      <canvas id="wind-canvas"></canvas>
+      <canvas id="hum-canvas"></canvas>
+      <div id="map"></div>
+
+      <!-- Status bar -->
+      <div id="status-bar">
+        <span class="st-dot" id="stDot"></span>
+        <span id="stText">CARGANDO DATOS DE VIENTO…</span>
+      </div>
+
+      <!-- Legend -->
+      <div id="legend">
+        <div class="leg-row">
+          <span class="leg-title">VIENTO</span>
+          <div class="leg-wind-bar"></div>
+          <div class="leg-wind-labels"><span>0</span><span>5</span><span>10</span><span>15+</span><span class="leg-unit">m/s</span></div>
+        </div>
+        <div class="leg-sep"></div>
+        <div class="leg-row">
+          <span class="leg-title">HUMEDAD</span>
+          <div class="leg-hum-bar"></div>
+          <div class="leg-hum-labels"><span>0%</span><span>50%</span><span>100%</span></div>
+        </div>
+      </div>
+
+      <!-- Click hint -->
+      <div id="click-hint">
+        <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.2"/><circle cx="8" cy="8" r="2" fill="currentColor"/></svg>
+        Clic en el terreno para analizar
+      </div>
+
+      <!-- Compass -->
+      <div id="compass">
+        <svg viewBox="0 0 44 44" fill="none">
+          <circle cx="22" cy="22" r="20" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+          <path d="M22 5 L26 22 L22 20 L18 22 Z" fill="#e84444"/>
+          <path d="M22 39 L18 22 L22 24 L26 22 Z" fill="rgba(255,255,255,0.45)"/>
+          <circle cx="22" cy="22" r="2.5" fill="white"/>
+          <text x="22" y="3.5" text-anchor="middle" fill="rgba(255,255,255,0.6)" font-size="4.5" font-family="DM Mono">N</text>
+        </svg>
+      </div>
+    </div>
+
+    <!-- ANALYSIS PANEL -->
+    <aside id="panel">
+      <div id="panel-scroll">
+
+        <!-- Empty -->
+        <div id="p-empty">
+          <div class="p-empty-icon">
+            <svg viewBox="0 0 72 72" fill="none">
+              <circle cx="36" cy="36" r="34" stroke="currentColor" stroke-width="0.8" stroke-dasharray="3 5"/>
+              <path d="M36 14C36 14 22 28 22 38C22 46 28 52 36 52C44 52 50 46 50 38C50 28 36 14 36 14Z"
+                    stroke="currentColor" stroke-width="1.3" fill="none" opacity="0.4"/>
+            </svg>
+          </div>
+          <p>Haz clic en el mapa para analizar un punto</p>
+          <p class="p-empty-sub">Viento y humedad se actualizan al mover el mapa</p>
+        </div>
+
+        <!-- Results -->
+        <div id="p-results" class="hidden">
+
+          <!-- Location -->
+          <section class="ps">
+            <div class="ps-label">UBICACIÓN</div>
+            <div class="coord-grid">
+              <div class="crd"><span class="crd-k">LAT</span><span class="crd-v" id="rLat">—</span></div>
+              <div class="crd"><span class="crd-k">LON</span><span class="crd-v" id="rLon">—</span></div>
+              <div class="crd"><span class="crd-k">ELEV</span><span class="crd-v" id="rElev">—</span></div>
+              <div class="crd"><span class="crd-k">COSTA</span><span class="crd-v" id="rCoast">—</span></div>
+            </div>
+          </section>
+
+          <!-- Score -->
+          <section class="ps">
+            <div class="ps-label">FACTIBILIDAD NIEBLA</div>
+            <div class="score-wrap">
+              <svg class="score-svg" viewBox="0 0 110 110">
+                <circle cx="55" cy="55" r="46" stroke="rgba(255,255,255,0.06)" stroke-width="7" fill="none"/>
+                <circle cx="55" cy="55" r="46" stroke="url(#sg)" stroke-width="7" fill="none"
+                  stroke-linecap="round" stroke-dasharray="289" stroke-dashoffset="289"
+                  id="scoreArc" transform="rotate(-90 55 55)"/>
+                <defs>
+                  <linearGradient id="sg" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" stop-color="#00c8ff" id="sg0"/>
+                    <stop offset="100%" stop-color="#00ffaa" id="sg1"/>
+                  </linearGradient>
+                </defs>
+                <text x="55" y="50" text-anchor="middle" id="scoreNum"
+                      font-family="Syne" font-size="24" font-weight="700" fill="white">0</text>
+                <text x="55" y="64" text-anchor="middle"
+                      font-family="DM Mono" font-size="10" fill="rgba(255,255,255,0.4)">%</text>
+              </svg>
+              <div class="score-meta">
+                <div class="score-label" id="scoreLabel">—</div>
+                <div class="score-limit" id="scoreLim"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Water Yield -->
+          <section class="ps">
+            <div class="ps-label">RENDIMIENTO HÍDRICO</div>
+            <div class="yield-box">
+              <span class="yield-n" id="yieldVal">—</span>
+              <span class="yield-u">L/m²/día</span>
+            </div>
+            <div class="yield-note" id="yieldNote"></div>
+          </section>
+
+          <!-- Factors -->
+          <section class="ps">
+            <div class="ps-label">FACTORES DE ANÁLISIS</div>
+            <div id="factorList"></div>
+          </section>
+
+          <!-- Atmosphere -->
+          <section class="ps">
+            <div class="ps-label">DATOS ATMOSFÉRICOS</div>
+            <div class="atm-grid" id="atmGrid"></div>
+          </section>
+
+          <!-- Monthly chart -->
+          <section class="ps">
+            <div class="ps-label">
+              POTENCIAL MENSUAL
+              <span id="chartBadge" class="badge-loading hidden">cargando…</span>
+            </div>
+            <div class="chart-box"><canvas id="monthChart"></canvas></div>
+            <div class="chart-note">L/m²/día estimado · año anterior</div>
+          </section>
+
+          <!-- Export -->
+          <section class="ps">
+            <div class="ps-label">EXPORTAR</div>
+            <div class="exp-btns">
+              <button class="exp-btn" id="expCSV">
+                <svg viewBox="0 0 18 18" fill="none"><rect x="3" y="1" width="12" height="16" rx="1.5" stroke="currentColor" stroke-width="1.2"/><line x1="6" y1="6" x2="12" y2="6" stroke="currentColor" stroke-width="1.2"/><line x1="6" y1="9" x2="12" y2="9" stroke="currentColor" stroke-width="1.2"/><line x1="6" y1="12" x2="9" y2="12" stroke="currentColor" stroke-width="1.2"/></svg>
+                CSV
+              </button>
+              <button class="exp-btn" id="expJSON">
+                <svg viewBox="0 0 18 18" fill="none"><path d="M6 3C4 3 3 4 3 6V12C3 14 4 15 6 15" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M12 3C14 3 15 4 15 6V12C15 14 14 15 12 15" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="9" cy="9" r="1.5" fill="currentColor"/></svg>
+                JSON
+              </button>
+              <button class="exp-btn" id="expIMG">
+                <svg viewBox="0 0 18 18" fill="none"><rect x="1" y="3" width="16" height="12" rx="1.5" stroke="currentColor" stroke-width="1.2"/><circle cx="6.5" cy="8" r="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M1 13L5 9L8 12L12 8L17 13" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                IMG
+              </button>
+            </div>
+          </section>
+
+        </div><!-- /p-results -->
+
+        <!-- Panel loading -->
+        <div id="p-loading" class="hidden">
+          <div class="p-spin"></div>
+          <span>Obteniendo datos…</span>
+        </div>
+
+      </div>
+    </aside>
+
+  </main>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
