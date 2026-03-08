@@ -877,11 +877,11 @@ document.getElementById('btnPanel').addEventListener('click', () => {
   setTimeout(()=>S.map&&S.map.resize(), 320);
 });
 
-window.addEventListener('DOMContentLoaded', () => {
-  initMap();
-  initSearch();
-  initOpacityPopovers();
-});
+/* Script loads at bottom of <body> — DOM is already parsed.
+   Call directly; DOMContentLoaded may have already fired. */
+initMap();
+initSearch();
+initOpacityPopovers();
 
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1718,7 +1718,10 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btnWindTunnel').addEventListener('click', initWindTunnel);
     document.getElementById('wt-close').addEventListener('click', closeOverlay);
     document.addEventListener('keydown', e => {
-      if (e.key === 'Escape') closeOverlay();
+      if (e.key === 'Escape' &&
+          !document.getElementById('wt-overlay').classList.contains('wt-hidden')) {
+        closeOverlay();
+      }
     });
     /* Click on overlay backdrop (not modal) */
     document.getElementById('wt-overlay').addEventListener('click', e => {
@@ -1762,8 +1765,8 @@ window.addEventListener('DOMContentLoaded', () => {
     setupDragDrop();
   }
 
-  /* Boot when DOM is ready */
-  window.addEventListener('DOMContentLoaded', wireEvents);
+  /* Script is at bottom of <body> — DOM already parsed, call directly */
+  wireEvents();
 
 })(); /* end IIFE */
 
@@ -2925,7 +2928,7 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('archExportData').addEventListener('click', exportArchDataCard);
   }
 
-  /* Boot */
-  window.addEventListener('DOMContentLoaded', wireArchEvents);
+  /* Script is at bottom of <body> — DOM already parsed, call directly */
+  wireArchEvents();
 
 })(); /* end §19 Architecture Sim IIFE */
