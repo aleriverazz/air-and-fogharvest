@@ -904,6 +904,881 @@
   </div><!-- /arch-modal -->
 </div><!-- /arch-overlay -->
 
+<!-- ════════════════════════════════════════════════════════
+     3D WIND TUNNEL MODAL (NEW)
+════════════════════════════════════════════════════════ -->
+<div id="tunnel-overlay" class="tunnel-overlay hidden">
+  <div id="tunnel-modal" class="tunnel-modal">
+
+    <!-- CLOSE BUTTON -->
+    <button id="btnTunnelClose" class="tunnel-close" title="Close">
+      <svg viewBox="0 0 18 18" fill="none">
+        <line x1="3" y1="3" x2="15" y2="15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <line x1="15" y1="3" x2="3" y2="15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    </button>
+
+    <!-- HEADER -->
+    <div class="tunnel-header">
+      <h2>3D WIND TUNNEL ANALYSIS</h2>
+      <p class="tunnel-subtitle">Architecture-Scale Airflow Analysis</p>
+      <p class="tunnel-hint">1 unit = 1 m</p>
+    </div>
+
+    <!-- MAIN BODY: 3 COLUMNS -->
+    <div class="tunnel-body">
+
+      <!-- ════ COL 1: 3D VIEWPORT + MODEL UPLOAD ════ -->
+      <div class="tunnel-col tunnel-col-1">
+        <div class="tunnel-viewport-wrap">
+          <!-- Canvas for Three.js -->
+          <canvas id="tunnelCanvas"></canvas>
+
+          <!-- Status badge (center) -->
+          <div id="tunnelStatus" class="tunnel-status">
+            <div class="ts-state">IDLE</div>
+            <div class="ts-detail"></div>
+          </div>
+
+          <!-- Orbit mode hint (corner) -->
+          <div class="tunnel-hint-box">
+            <div><strong>ORBIT</strong> · drag</div>
+            <div><strong>ZOOM</strong> · scroll</div>
+            <div><strong>PAN</strong> · right-drag</div>
+          </div>
+        </div>
+
+        <!-- MODEL UPLOAD AREA (below canvas) -->
+        <div class="tunnel-section tunnel-section-upload">
+          <div class="tunnel-section-label">
+            <svg viewBox="0 0 12 12" fill="none" width="10">
+              <rect x="2" y="2" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1"/>
+              <path d="M6 5v3M4.5 6.5H7.5" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            UPLOAD MODEL
+          </div>
+          
+          <!-- Drop zone -->
+          <div class="tunnel-dropzone" id="tunnelDropzone">
+            <div class="tz-inner">
+              <svg viewBox="0 0 36 36" fill="none" width="24">
+                <rect x="4" y="8" width="24" height="20" rx="2" stroke="currentColor" stroke-width="1.2"/>
+                <path d="M18 12v8M14 16h8" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <p>Drop or click to upload</p>
+              <p class="tz-formats">GLB · GLTF · OBJ · STL</p>
+            </div>
+          </div>
+          <input type="file" id="tunnelFileInput" accept=".glb,.gltf,.obj,.stl" style="display:none;"/>
+          
+          <!-- Loaded model info -->
+          <div id="tunnelModelInfo" class="tunnel-model-info hidden">
+            <div class="tmi-name" id="tunnelModelName">—</div>
+            <div class="tmi-size" id="tunnelModelSize">—</div>
+          </div>
+        </div>
+
+        <!-- REAL-WORLD SCALE -->
+        <div class="tunnel-section tunnel-section-scale">
+          <div class="tunnel-section-label">
+            <svg viewBox="0 0 12 12" fill="none" width="10">
+              <line x1="1" y1="6" x2="11" y2="6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+              <line x1="2" y1="4" x2="2" y2="8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+              <line x1="10" y1="4" x2="10" y2="8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+            </svg>
+            REAL-WORLD SCALE
+          </div>
+          
+          <div class="tunnel-scale-row">
+            <label class="tunnel-label">BUILDING HEIGHT</label>
+            <div class="tunnel-input-unit">
+              <input type="number" id="tunnelHeightInput" class="tunnel-input" placeholder="e.g. 25" min="1" step="1"/>
+              <span class="tunnel-unit">m</span>
+            </div>
+          </div>
+          
+          <div class="tunnel-scale-row">
+            <label class="tunnel-label">FOOTPRINT WIDTH</label>
+            <div class="tunnel-input-unit">
+              <input type="number" id="tunnelWidthInput" class="tunnel-input" placeholder="e.g. 40" min="1" step="1"/>
+              <span class="tunnel-unit">m</span>
+            </div>
+          </div>
+          
+          <p class="tunnel-scale-hint">Enter the real dimensions to calibrate the scene scale. If blank, model units are used as-is (1 unit = 1 m).</p>
+          
+          <button class="tunnel-btn tunnel-btn-sec" id="tunnelApplyScale">
+            <svg viewBox="0 0 12 12" fill="none" width="9">
+              <path d="M2 6h8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+              <path d="M6 2v8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+            </svg>
+            APPLY SCALE
+          </button>
+        </div>
+
+        <!-- TRANSFORM -->
+        <div class="tunnel-section tunnel-section-transform">
+          <div class="tunnel-section-label">
+            <svg viewBox="0 0 12 12" fill="none" width="10">
+              <rect x="1" y="1" width="10" height="10" rx="1" stroke="currentColor" stroke-width="1"/>
+              <path d="M4 8l2-2 3-3M8 5V3h2" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.6"/>
+            </svg>
+            TRANSFORM
+          </div>
+
+          <div class="tunnel-transform-grid">
+            <div class="tunnel-tf-item">
+              <label>SCALE</label>
+              <input type="range" id="tunnelScaleSlider" min="0.1" max="5" step="0.1" value="1" class="tunnel-slider"/>
+              <span class="tunnel-tf-val" id="tunnelScaleVal">1.0×</span>
+            </div>
+
+            <div class="tunnel-tf-item">
+              <label>ROT Y</label>
+              <input type="range" id="tunnelRotSlider" min="0" max="360" step="5" value="0" class="tunnel-slider"/>
+              <span class="tunnel-tf-val" id="tunnelRotVal">0°</span>
+            </div>
+
+            <div class="tunnel-tf-item">
+              <label>ELEVATION</label>
+              <div class="tunnel-input-unit">
+                <input type="number" id="tunnelElevInput" class="tunnel-input tunnel-input-sm" value="0" step="1"/>
+                <span class="tunnel-unit">m</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div><!-- /tunnel-col-1 -->
+
+      <!-- ════ COL 2: SETTINGS + CLIMATE + SIMULATION ════ -->
+      <div class="tunnel-col tunnel-col-2">
+        <div class="tunnel-scroll">
+
+          <!-- GEOGRAPHIC LOCATION -->
+          <div class="tunnel-section">
+            <div class="tunnel-section-label">
+              <svg viewBox="0 0 12 12" fill="none" width="10">
+                <circle cx="6" cy="5" r="2" stroke="currentColor" stroke-width="1"/>
+                <path d="M6 1C3.8 1 2 2.8 2 5c0 3 4 7 4 7s4-4 4-7c0-2.2-1.8-4-4-4z" stroke="currentColor" stroke-width="1"/>
+              </svg>
+              GEOGRAPHIC LOCATION
+            </div>
+
+            <button class="tunnel-btn tunnel-btn-sec" id="tunnelUseMapPoint">
+              <svg viewBox="0 0 12 12" fill="none" width="9">
+                <circle cx="6" cy="5" r="2" stroke="currentColor" stroke-width="1.1"/>
+                <path d="M6 1C3.8 1 2 2.8 2 5c0 3 4 7 4 7s4-4 4-7c0-2.2-1.8-4-4-4z" stroke="currentColor" stroke-width="1.1"/>
+              </svg>
+              USE MAIN MAP POINT
+            </button>
+
+            <div class="tunnel-or-divider"><span>or enter manually</span></div>
+
+            <div class="tunnel-field-row">
+              <label>LATITUDE</label>
+              <input type="number" id="tunnelLat" class="tunnel-input tunnel-input-full" placeholder="e.g. 32.5215" step="0.0001"/>
+            </div>
+
+            <div class="tunnel-field-row">
+              <label>LONGITUDE</label>
+              <input type="number" id="tunnelLon" class="tunnel-input tunnel-input-full" placeholder="e.g. -116.943" step="0.0001"/>
+            </div>
+
+            <div class="tunnel-field-row">
+              <label>ELEVATION</label>
+              <div class="tunnel-input-unit">
+                <input type="number" id="tunnelLocElev" class="tunnel-input" placeholder="e.g. 320" step="1"/>
+                <span class="tunnel-unit">m asl</span>
+              </div>
+            </div>
+
+            <div class="tunnel-field-row">
+              <label>PROJECT NAME</label>
+              <input type="text" id="tunnelProjName" class="tunnel-input tunnel-input-full" placeholder="e.g. Torre Niebla"/>
+            </div>
+          </div>
+
+          <!-- CLIMATE DATA -->
+          <div class="tunnel-section">
+            <div class="tunnel-section-label">
+              <svg viewBox="0 0 12 12" fill="none" width="10">
+                <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1"/>
+                <path d="M6 3.5v2.5l1.5 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+              </svg>
+              CLIMATE DATA
+            </div>
+
+            <div class="tunnel-field-row">
+              <label>ANALYSIS MONTH</label>
+              <select id="tunnelMonth" class="tunnel-select">
+                <option value="1">January</option><option value="2">February</option>
+                <option value="3" selected>March</option><option value="4">April</option>
+                <option value="5">May</option><option value="6">June</option>
+                <option value="7">July</option><option value="8">August</option>
+                <option value="9">September</option><option value="10">October</option>
+                <option value="11">November</option><option value="12">December</option>
+              </select>
+            </div>
+
+            <button class="tunnel-btn tunnel-btn-sec" id="tunnelFetchClimate">
+              <svg viewBox="0 0 12 12" fill="none" width="9">
+                <path d="M6 2v5M4 5l2 2 2-2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+                <line x1="2" y1="10" x2="10" y2="10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+              </svg>
+              FETCH CLIMATE (ICON)
+            </button>
+
+            <div id="tunnelClimateGrid" class="tunnel-climate-grid hidden"></div>
+          </div>
+
+          <!-- SIMULATION -->
+          <div class="tunnel-section">
+            <div class="tunnel-section-label">
+              <svg viewBox="0 0 12 12" fill="none" width="10">
+                <path d="M2.5 2l8 4-8 4V2z" stroke="currentColor" stroke-width="1" fill="none"/>
+              </svg>
+              SIMULATION
+            </div>
+
+            <div class="tunnel-slider-row">
+              <span class="tunnel-sl-lbl">PARTICLES</span>
+              <input type="range" id="tunnelParticles" min="500" max="5000" step="250" value="3000" class="tunnel-slider"/>
+              <span class="tunnel-sl-val" id="tunnelParticlesVal">3000</span>
+            </div>
+
+            <div class="tunnel-slider-row">
+              <span class="tunnel-sl-lbl">WIND SPD</span>
+              <input type="range" id="tunnelWindOverride" min="0.5" max="20" step="0.5" value="0" class="tunnel-slider"/>
+              <span class="tunnel-sl-val" id="tunnelWindOverrideVal">AUTO</span>
+            </div>
+
+            <div class="tunnel-field-row">
+              <label>COLLECTION AREA</label>
+              <div class="tunnel-input-unit">
+                <input type="number" id="tunnelAreaInput" class="tunnel-input" placeholder="auto" min="0.1" step="1"/>
+                <span class="tunnel-unit">m²</span>
+              </div>
+            </div>
+
+            <button class="tunnel-btn tunnel-btn-run" id="tunnelRunSim">
+              <svg viewBox="0 0 12 12" fill="none" width="9">
+                <path d="M2 2l9 4-9 4V2z" fill="currentColor"/>
+              </svg>
+              RUN SIMULATION
+            </button>
+
+            <button class="tunnel-btn tunnel-btn-sec" id="tunnelResetSim" style="margin-top:6px">
+              <svg viewBox="0 0 12 12" fill="none" width="9">
+                <path d="M10 6A4 4 0 1 0 9 9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                <path d="M10 4v3H7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              RESET
+            </button>
+          </div>
+
+        </div><!-- /tunnel-scroll -->
+      </div><!-- /tunnel-col-2 -->
+
+      <!-- ════ COL 3: RESULTS + PLACEMENT ════ -->
+      <div class="tunnel-col tunnel-col-3">
+        <div class="tunnel-scroll">
+
+          <!-- RESULTS (hidden until sim runs) -->
+          <div class="tunnel-section tunnel-results-hidden" id="tunnelResultsSection">
+            <div class="tunnel-section-label">
+              <svg viewBox="0 0 12 12" fill="none" width="10">
+                <path d="M2 9l2.5-2.5 2 2 2.5-3.5 3 4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              RESULTS
+            </div>
+
+            <!-- Big harvest number -->
+            <div class="tunnel-harvest-hero">
+              <div class="tunnel-harvest-num" id="tunnelHarvestNum">—</div>
+              <div class="tunnel-harvest-unit">L / m² / day</div>
+              <div class="tunnel-harvest-monthly">
+                Monthly: <strong id="tunnelHarvestMonthly">—</strong> L/m²
+              </div>
+            </div>
+
+            <div id="tunnelResultsGrid" class="tunnel-results-grid"></div>
+
+            <!-- Export button -->
+            <button class="tunnel-btn tunnel-btn-sec" id="tunnelExportData" style="margin-top:10px">
+              <svg viewBox="0 0 12 12" fill="none" width="9">
+                <rect x="2" y="1" width="8" height="10" rx="1" stroke="currentColor" stroke-width="1"/>
+                <path d="M4 4h4M4 6h4M4 8h2" stroke="currentColor" stroke-width="0.9" stroke-linecap="round"/>
+              </svg>
+              EXPORT DATA CARD
+            </button>
+          </div>
+
+          <!-- PLACE ON MAP -->
+          <div class="tunnel-section tunnel-results-hidden" id="tunnelPlaceSection">
+            <div class="tunnel-section-label">
+              <svg viewBox="0 0 12 12" fill="none" width="10">
+                <circle cx="6" cy="5" r="2" stroke="currentColor" stroke-width="1"/>
+                <path d="M6 1C3.8 1 2 2.8 2 5c0 3 4 7 4 7s4-4 4-7c0-2.2-1.8-4-4-4z" stroke="currentColor" stroke-width="1"/>
+              </svg>
+              PLACE ON MAIN MAP
+            </div>
+            <p class="tunnel-hint-p">Coloca el modelo en el punto seleccionado en el mapa principal.</p>
+            <button class="tunnel-btn tunnel-btn-sec" id="tunnelPlaceOnMap">
+              <svg viewBox="0 0 12 12" fill="none" width="9">
+                <circle cx="6" cy="5" r="2" stroke="currentColor" stroke-width="1.1"/>
+                <path d="M6 1C3.8 1 2 2.8 2 5c0 3 4 7 4 7s4-4 4-7c0-2.2-1.8-4-4-4z" stroke="currentColor" stroke-width="1.1"/>
+              </svg>
+              COLOCAR EN MAPA PRINCIPAL
+            </button>
+          </div>
+
+        </div><!-- /tunnel-scroll -->
+      </div><!-- /tunnel-col-3 -->
+
+    </div><!-- /tunnel-body -->
+
+  </div><!-- /tunnel-modal -->
+</div><!-- /tunnel-overlay -->
+
 <script src="script.js"></script>
 </body>
 </html>
+
+
+/* ════════════════════════════════════════════════════════
+   3D WIND TUNNEL MODAL — Complete CSS
+   Add this entire section to the END of your style.css
+════════════════════════════════════════════════════════ */
+
+.tunnel-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.8);
+  z-index: 950;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 1;
+  transition: opacity 0.3s;
+}
+
+.tunnel-overlay.hidden {
+  display: none;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tunnel-modal {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  width: 95vw;
+  height: 90vh;
+  max-width: 1600px;
+  max-height: 900px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.8);
+  color: var(--text);
+}
+
+.tunnel-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,200,255,0.05);
+  border: 1px solid rgba(0,200,255,0.1);
+  border-radius: var(--radius);
+  color: var(--accent);
+  cursor: pointer;
+  z-index: 10;
+  transition: all 0.2s;
+}
+
+.tunnel-close:hover {
+  background: rgba(0,200,255,0.15);
+  border-color: var(--accent);
+}
+
+.tunnel-close svg {
+  width: 16px;
+  height: 16px;
+}
+
+.tunnel-header {
+  padding: 20px 30px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.tunnel-header h2 {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0 0 4px 0;
+  letter-spacing: 1px;
+  color: var(--accent);
+}
+
+.tunnel-subtitle {
+  font-size: 11px;
+  color: var(--text2);
+  margin: 0;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.tunnel-hint {
+  font-size: 10px;
+  color: var(--mute);
+  margin: 4px 0 0 0;
+}
+
+.tunnel-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+.tunnel-col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: var(--bg);
+  overflow-y: auto;
+}
+
+.tunnel-col:last-child { border-right: none; }
+
+.tunnel-col-1 { flex: 0 0 35%; }
+.tunnel-col-2 { flex: 0 0 35%; }
+.tunnel-col-3 { flex: 1; }
+
+.tunnel-col::-webkit-scrollbar { width: 6px; }
+.tunnel-col::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+.tunnel-viewport-wrap {
+  position: relative;
+  height: 350px;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#tunnelCanvas {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
+
+.tunnel-status {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  background: rgba(0,0,0,0.7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-size: 10px;
+  z-index: 5;
+}
+
+.ts-state {
+  font-weight: 700;
+  color: var(--accent2);
+  letter-spacing: 1px;
+}
+
+.ts-detail {
+  font-size: 9px;
+  color: var(--mute);
+  margin-top: 2px;
+}
+
+.tunnel-hint-box {
+  position: absolute;
+  bottom: 10px;
+  right: 10px;
+  background: rgba(0,0,0,0.7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-size: 9px;
+  color: var(--text2);
+  z-index: 5;
+  line-height: 1.6;
+}
+
+.tunnel-section {
+  border-bottom: 1px solid var(--border);
+  padding: 15px;
+  flex-shrink: 0;
+}
+
+.tunnel-section:last-child { border-bottom: none; }
+
+.tunnel-section-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text2);
+  margin-bottom: 12px;
+}
+
+.tunnel-section-label svg {
+  width: 12px;
+  height: 12px;
+  color: var(--accent);
+}
+
+.tunnel-dropzone {
+  border: 2px dashed var(--border2);
+  border-radius: var(--radius);
+  padding: 30px 15px;
+  text-align: center;
+  cursor: pointer;
+  background: rgba(0,200,255,0.02);
+  transition: all 0.3s;
+  min-height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tunnel-dropzone:hover {
+  border-color: var(--accent);
+  background: rgba(0,200,255,0.08);
+}
+
+.tunnel-dropzone.dragover {
+  border-color: var(--accent2);
+  background: rgba(0,255,170,0.1);
+}
+
+.tz-inner {
+  pointer-events: none;
+  user-select: none;
+}
+
+.tz-inner svg {
+  width: 24px;
+  height: 24px;
+  color: var(--text2);
+  margin-bottom: 8px;
+}
+
+.tz-inner p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text2);
+}
+
+.tz-formats {
+  font-size: 9px;
+  color: var(--mute);
+  margin-top: 4px !important;
+}
+
+.tunnel-model-info {
+  background: rgba(0,255,170,0.08);
+  border: 1px solid rgba(0,255,170,0.2);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin-top: 10px;
+}
+
+.tunnel-model-info.hidden { display: none; }
+
+.tmi-name {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent2);
+  margin-bottom: 4px;
+}
+
+.tmi-size {
+  font-size: 9px;
+  color: var(--mute);
+}
+
+.tunnel-scroll {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.tunnel-scroll::-webkit-scrollbar { width: 6px; }
+.tunnel-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+.tunnel-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  border-radius: var(--radius);
+  transition: all 0.2s;
+  margin-bottom: 8px;
+}
+
+.tunnel-input:focus {
+  outline: none;
+  border-color: var(--border2);
+  background: var(--surface);
+}
+
+.tunnel-input-unit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tunnel-unit {
+  font-size: 9px;
+  color: var(--text2);
+  white-space: nowrap;
+}
+
+.tunnel-select {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  border-radius: var(--radius);
+  cursor: pointer;
+  margin-bottom: 8px;
+  transition: all 0.2s;
+}
+
+.tunnel-select:focus {
+  outline: none;
+  border-color: var(--border2);
+  background: var(--surface);
+}
+
+.tunnel-label {
+  display: block;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text2);
+  margin-bottom: 4px;
+  letter-spacing: 0.5px;
+}
+
+.tunnel-field-row {
+  margin-bottom: 10px;
+}
+
+.tunnel-field-row:last-child { margin-bottom: 0; }
+
+.tunnel-scale-row {
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tunnel-slider {
+  flex: 1;
+  height: 4px;
+  border: none;
+  border-radius: 2px;
+  background: var(--mute);
+  cursor: pointer;
+  accent-color: var(--accent);
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.tunnel-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.tunnel-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+  box-shadow: 0 0 8px rgba(0,200,255,0.5);
+}
+
+.tunnel-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+  transition: all 0.2s;
+}
+
+.tunnel-sl-lbl {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text2);
+  min-width: 60px;
+  letter-spacing: 0.5px;
+}
+
+.tunnel-sl-val {
+  font-size: 10px;
+  color: var(--accent);
+  font-weight: 700;
+  min-width: 45px;
+  text-align: right;
+}
+
+.tunnel-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  cursor: pointer;
+  border-radius: var(--radius);
+  transition: all 0.2s;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.tunnel-btn:hover {
+  border-color: var(--border2);
+  background: var(--surface);
+  color: var(--accent);
+}
+
+.tunnel-btn-sec {
+  background: rgba(0,200,255,0.05);
+  border-color: rgba(0,200,255,0.1);
+}
+
+.tunnel-btn-sec:hover {
+  background: rgba(0,200,255,0.12);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.tunnel-btn-run {
+  background: rgba(0,255,170,0.15);
+  border-color: var(--accent2);
+  color: var(--accent2);
+  font-weight: 700;
+}
+
+.tunnel-btn-run:hover {
+  background: rgba(0,255,170,0.25);
+  box-shadow: 0 0 12px rgba(0,255,170,0.3);
+}
+
+.tunnel-or-divider {
+  text-align: center;
+  margin: 12px 0;
+  position: relative;
+  font-size: 9px;
+  color: var(--mute);
+}
+
+.tunnel-or-divider::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  right: 0;
+  height: 1px;
+  background: var(--border);
+}
+
+.tunnel-or-divider span {
+  background: var(--bg);
+  padding: 0 8px;
+  position: relative;
+}
+
+.tunnel-scale-hint {
+  font-size: 9px;
+  color: var(--text2);
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
+.tunnel-harvest-hero {
+  text-align: center;
+  padding: 15px;
+  background: rgba(0,255,170,0.08);
+  border: 1px solid rgba(0,255,170,0.15);
+  border-radius: var(--radius);
+  margin: 10px 0;
+}
+
+.tunnel-harvest-num {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--accent2);
+  margin-bottom: 4px;
+}
+
+.tunnel-harvest-unit {
+  font-size: 9px;
+  color: var(--mute);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.tunnel-harvest-monthly {
+  font-size: 10px;
+  color: var(--text2);
+}
+
+.tunnel-results-hidden { display: none; }
+
+.tunnel-hint-p {
+  font-size: 10px;
+  color: var(--text2);
+  margin: 0 0 10px 0;
+  line-height: 1.5;
+}
+
+@media (max-width: 1200px) {
+  .tunnel-col-1 { flex: 0 0 40%; }
+  .tunnel-col-2 { flex: 0 0 35%; }
+}
+
+@media (max-width: 800px) {
+  .tunnel-modal { flex-direction: column; }
+  .tunnel-body { flex-direction: column; }
+  .tunnel-col {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    flex: 1;
+  }
+  .tunnel-col:last-child { border-bottom: none; }
+}

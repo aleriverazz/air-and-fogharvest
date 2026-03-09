@@ -2029,7 +2029,8 @@ initOpacityPopovers();
       [14,22,12],[20,40,18],[12,28,10],[24,38,22],[10,15,10],[18,32,16],
       [16,28,14],[20,50,18],[15,25,12],[22,42,20],
     ];
-    positions.forEach(([x,y,z],[w,h,d]) => {
+    positions.forEach(([x,y,z], i) => {
+      const [w,h,d] = sizes[i];
       const geo  = new THREE.BoxGeometry(w, h, d);
       const mesh = new THREE.Mesh(geo, boxMat);
       mesh.position.set(x, h/2, z);
