@@ -2966,3 +2966,345 @@ initOpacityPopovers();
   wireArchEvents();
 
 })(); /* end §19 Architecture Sim IIFE */
+
+/* ═══════════════════════════════════════════════════════════════════════
+   3D WIND TUNNEL MODEL UPLOAD FIX
+   Add this entire section to the END of your script.js
+   ═══════════════════════════════════════════════════════════════════════ */
+
+let TUNNEL_SCENE = null;
+let TUNNEL_CAMERA = null;
+let TUNNEL_RENDERER = null;
+let TUNNEL_CONTROLS = null;
+let TUNNEL_CURRENT_MODEL = null;
+
+function initTunnelModal() {
+  const btnTunnel = document.getElementById('btnWindTunnel');
+  const overlay = document.getElementById('tunnel-overlay');
+  const closeBtn = document.getElementById('btnTunnelClose');
+
+  if (!btnTunnel || !overlay) return;
+
+  btnTunnel.addEventListener('click', () => {
+    overlay.classList.remove('hidden');
+    setTimeout(() => {
+      if (!TUNNEL_RENDERER) {
+        initTunnelViewer();
+      }
+    }, 100);
+  });
+
+  closeBtn.addEventListener('click', () => {
+    overlay.classList.add('hidden');
+  });
+
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) {
+      overlay.classList.add('hidden');
+    }
+  });
+}
+
+function initTunnelViewer() {
+  const canvas = document.getElementById('tunnelCanvas');
+  if (!canvas || TUNNEL_RENDERER) return;
+
+  const width = canvas.parentElement.clientWidth;
+  const height = canvas.parentElement.clientHeight;
+
+  TUNNEL_RENDERER = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  TUNNEL_RENDERER.setSize(width, height);
+  TUNNEL_RENDERER.setClearColor(0x1a1a1a, 1);
+  TUNNEL_RENDERER.shadowMap.enabled = true;
+
+  TUNNEL_SCENE = new THREE.Scene();
+  TUNNEL_SCENE.background = new THREE.Color(0x1a1a1a);
+
+  TUNNEL_CAMERA = new THREE.PerspectiveCamera(60, width / height, 0.1, 2000);
+  TUNNEL_CAMERA.position.set(50, 30, 50);
+  TUNNEL_CAMERA.lookAt(0, 0, 0);
+
+  const ambLight = new THREE.AmbientLight(0xffffff, 0.7);
+  TUNNEL_SCENE.add(ambLight);
+
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(100, 100, 100);
+  dirLight.castShadow = true;
+  TUNNEL_SCENE.add(dirLight);
+
+  const groundGeom = new THREE.PlaneGeometry(200, 200);
+  const groundMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
+  const ground = new THREE.Mesh(groundGeom, groundMat);
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  TUNNEL_SCENE.add(ground);
+
+  TUNNEL_CONTROLS = new THREE.OrbitControls(TUNNEL_CAMERA, TUNNEL_RENDERER.domElement);
+  TUNNEL_CONTROLS.enableDamping = true;
+  TUNNEL_CONTROLS.dampingFactor = 0.05;
+  TUNNEL_CONTROLS.autoRotate = true;
+  TUNNEL_CONTROLS.autoRotateSpeed = 2;
+
+  function animate() {
+    requestAnimationFrame(animate);
+    TUNNEL_CONTROLS.update();
+    TUNNEL_RENDERER.render(TUNNEL_SCENE, TUNNEL_CAMERA);
+  }
+  animate();
+
+  window.addEventListener('resize', () => {
+    const w = canvas.parentElement.clientWidth;
+    const h = canvas.parentElement.clientHeight;
+    TUNNEL_CAMERA.aspect = w / h;
+    TUNNEL_CAMERA.updateProjectionMatrix();
+    TUNNEL_RENDERER.setSize(w, h);
+  });
+
+  initModelUpload();
+}
+
+function initModelUpload() {
+  const dropzone = document.getElementById('tunnelDropzone');
+  const fileInput = document.getElementById('tunnelFileInput');
+
+  if (!dropzone || !fileInput) return;
+
+  dropzone.addEventListener('click', () => {
+    fileInput.click();
+  });
+
+  fileInput.addEventListener('change', (e) => {
+    if (e.target.files.length > 0) {
+      handleModelFile(e.target.files[0]);
+    }
+  });
+
+  dropzone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropzone.classList.add('dragover');
+  });
+
+  dropzone.addEventListener('dragleave', () => {
+    dropzone.classList.remove('dragover');
+  });
+
+  dropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('dragover');
+    if (e.dataTransfer.files.length > 0) {
+      handleModelFile(e.dataTransfer.files[0]);
+    }
+  });
+}
+
+function handleModelFile(file) {
+  const validExtensions = ['.glb', '.gltf', '.obj', '.stl'];
+  const ext = '.' + file.name.split('.').pop().toLowerCase();
+
+  if (!validExtensions.includes(ext)) {
+    alert('❌ Format not supported. Use: GLB, GLTF, OBJ, or STL');
+    return;
+  }
+
+  if (file.size > 50 * 1024 * 1024) {
+    alert('❌ File too large (max 50 MB)');
+    return;
+  }
+
+  const dropzone = document.getElementById('tunnelDropzone');
+  dropzone.innerHTML = '<div style="padding: 20px; color: #888;">📦 Loading model...</div>';
+
+  const reader = new FileReader();
+
+  reader.onload = (event) => {
+    try {
+      const arrayBuffer = event.target.result;
+      loadModel(arrayBuffer, file.name, ext);
+      dropzone.innerHTML = `<div style="color: #4CAF50; padding: 15px; text-align: center;">✓ <strong>${file.name}</strong><br><small>Ready to place</small></div>`;
+    } catch (error) {
+      console.error('Model load error:', error);
+      dropzone.innerHTML = `<div style="color: #ff6b6b;">❌ ${error.message}</div>`;
+      setTimeout(() => {
+        dropzone.innerHTML = '<svg viewBox="0 0 36 36" fill="none" width="24"><rect x="4" y="8" width="24" height="20" rx="2" stroke="currentColor" stroke-width="1.2"/><path d="M18 12v8M14 16h8" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/></svg><p>Drop or click to upload</p>';
+      }, 3000);
+    }
+  };
+
+  reader.onerror = () => {
+    alert('❌ Error reading file');
+  };
+
+  reader.readAsArrayBuffer(file);
+}
+
+function loadModel(arrayBuffer, filename, ext) {
+  if (TUNNEL_CURRENT_MODEL) {
+    TUNNEL_SCENE.remove(TUNNEL_CURRENT_MODEL);
+    TUNNEL_CURRENT_MODEL = null;
+  }
+
+  if (ext === '.glb' || ext === '.gltf') {
+    loadGLB(arrayBuffer, filename);
+  } else if (ext === '.obj') {
+    loadOBJ(arrayBuffer, filename);
+  } else if (ext === '.stl') {
+    loadSTL(arrayBuffer, filename);
+  }
+}
+
+function loadGLB(arrayBuffer, filename) {
+  const blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+
+  const loader = new THREE.GLTFLoader();
+  loader.load(
+    url,
+    (gltf) => {
+      const model = gltf.scene;
+      updateTunnelModel(model, filename);
+      URL.revokeObjectURL(url);
+    },
+    undefined,
+    (err) => {
+      console.error('GLB load error:', err);
+      throw new Error('Failed to load GLB: ' + err.message);
+    }
+  );
+}
+
+function loadOBJ(arrayBuffer, filename) {
+  const blob = new Blob([arrayBuffer], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+
+  if (!window.THREE || !window.THREE.OBJLoader) {
+    URL.revokeObjectURL(url);
+    throw new Error('OBJLoader not available. Convert to GLB for better support.');
+  }
+
+  const loader = new THREE.OBJLoader();
+  loader.load(
+    url,
+    (object) => {
+      updateTunnelModel(object, filename);
+      URL.revokeObjectURL(url);
+    },
+    undefined,
+    (err) => {
+      URL.revokeObjectURL(url);
+      throw new Error('Failed to load OBJ: ' + err.message);
+    }
+  );
+}
+
+function loadSTL(arrayBuffer, filename) {
+  const blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+
+  if (!window.THREE || !window.THREE.STLLoader) {
+    URL.revokeObjectURL(url);
+    throw new Error('STLLoader not available. Convert to GLB for better support.');
+  }
+
+  const loader = new THREE.STLLoader();
+  loader.load(
+    url,
+    (geometry) => {
+      const material = new THREE.MeshStandardMaterial({ color: 0x8B6F47, metalness: 0.3 });
+      const mesh = new THREE.Mesh(geometry, material);
+      updateTunnelModel(mesh, filename);
+      URL.revokeObjectURL(url);
+    },
+    undefined,
+    (err) => {
+      URL.revokeObjectURL(url);
+      throw new Error('Failed to load STL: ' + err.message);
+    }
+  );
+}
+
+function updateTunnelModel(model, filename) {
+  try {
+    model.castShadow = true;
+    model.receiveShadow = true;
+    TUNNEL_SCENE.add(model);
+    TUNNEL_CURRENT_MODEL = model;
+
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+
+    model.position.sub(center);
+
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const scale = maxDim > 0 ? 10 / maxDim : 1;
+    model.scale.multiplyScalar(scale);
+
+    const infoBox = document.getElementById('tunnelModelInfo');
+    infoBox.innerHTML = `
+      <div class="tmi-name">✓ ${filename}</div>
+      <div class="tmi-size">${size.x.toFixed(1)}m × ${size.y.toFixed(1)}m × ${size.z.toFixed(1)}m</div>
+    `;
+    infoBox.classList.remove('hidden');
+
+    const scaleSlider = document.getElementById('tunnelScaleSlider');
+    if (scaleSlider) {
+      scaleSlider.value = scale;
+      document.getElementById('tunnelScaleVal').textContent = scale.toFixed(1) + '×';
+    }
+
+    console.log('✓ Model loaded:', filename);
+  } catch (error) {
+    console.error('Error updating model:', error);
+    throw error;
+  }
+}
+
+function initTunnelTransforms() {
+  const scaleSlider = document.getElementById('tunnelScaleSlider');
+  const rotSlider = document.getElementById('tunnelRotSlider');
+  const elevInput = document.getElementById('tunnelElevInput');
+
+  if (scaleSlider) {
+    scaleSlider.addEventListener('input', () => {
+      if (TUNNEL_CURRENT_MODEL) {
+        const scale = parseFloat(scaleSlider.value);
+        TUNNEL_CURRENT_MODEL.scale.set(scale, scale, scale);
+        document.getElementById('tunnelScaleVal').textContent = scale.toFixed(1) + '×';
+      }
+    });
+  }
+
+  if (rotSlider) {
+    rotSlider.addEventListener('input', () => {
+      if (TUNNEL_CURRENT_MODEL) {
+        const rot = parseFloat(rotSlider.value) * Math.PI / 180;
+        TUNNEL_CURRENT_MODEL.rotation.y = rot;
+        document.getElementById('tunnelRotVal').textContent = Math.round(rotSlider.value) + '°';
+      }
+    });
+  }
+
+  if (elevInput) {
+    elevInput.addEventListener('change', () => {
+      if (TUNNEL_CURRENT_MODEL) {
+        const elev = parseFloat(elevInput.value) || 0;
+        TUNNEL_CURRENT_MODEL.position.y = elev;
+      }
+    });
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  initTunnelModal();
+  initTunnelTransforms();
+});
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    initTunnelModal();
+    initTunnelTransforms();
+  });
+} else {
+  initTunnelModal();
+  initTunnelTransforms();
+}
