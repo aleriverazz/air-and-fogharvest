@@ -74,13 +74,13 @@ const CFG = {
   API_MAX_RETRY: 2,
 
   WIND: {
-    PARTICLE_COUNT: 1800,
-    FADE:       0.97,
-    SPEED_SCALE: 0.18,
-    LINE_WIDTH:  0.9,
-    MAX_AGE:     120,
-    MAX_ALPHA:   0.40,
-    MIN_ALPHA:   0.10,
+    PARTICLE_COUNT: 2200,
+    FADE:       0.94,
+    SPEED_SCALE: 0.38,
+    LINE_WIDTH:  1.8,
+    MAX_AGE:     100,
+    MAX_ALPHA:   0.82,
+    MIN_ALPHA:   0.32,
   },
 
   F: {
@@ -536,7 +536,8 @@ function startWindParticles(){
 }
 function resetParticle(p,W,H){ p.x=Math.random()*W; p.y=Math.random()*H; p.age=0; p.px=null; p.py=null; }
 function windColor(speed){
-  const s=[[0,'#3a007a'],[2,'#1a3aff'],[5,'#00c8ff'],[8,'#00ffaa'],[11,'#aaff00'],[14,'#ffcc00'],[17,'#ff3300']];
+  /* Vivid, high-contrast palette — clearly visible against dark terrain */
+  const s=[[0,'#6600ff'],[2,'#0055ff'],[5,'#00ccff'],[8,'#00ffbb'],[11,'#ccff00'],[14,'#ffdd00'],[17,'#ff2200']];
   for(let i=1;i<s.length;i++){ const[s0,c0]=s[i-1],[s1,c1]=s[i]; if(speed<=s1) return lerpHex(c0,c1,(speed-s0)/(s1-s0)); }
   return s[s.length-1][1];
 }
@@ -551,12 +552,13 @@ function drawHumidityCanvas(){
   const W=S.humCanvas.width, H=S.humCanvas.height, img=S.humCtx.createImageData(W,H), d=img.data;
   for(let py=0;py<H;py++) for(let px=0;px<W;px++){
     const h=sampleHum(px,py), rgb=humColor(h), i=(py*W+px)*4;
-    d[i]=rgb.r; d[i+1]=rgb.g; d[i+2]=rgb.b; d[i+3]=Math.round(145*S.humOpacity);
+    d[i]=rgb.r; d[i+1]=rgb.g; d[i+2]=rgb.b; d[i+3]=Math.round(195*S.humOpacity);
   }
   S.humCtx.putImageData(img,0,0);
 }
 function humColor(h){
-  const s=[[0,'#8B0000'],[25,'#cc3300'],[45,'#ffaa00'],[65,'#aadd00'],[80,'#00ccff'],[100,'#0033cc']];
+  /* Vivid: deep red (dry) → orange → yellow → cyan → electric blue (humid) */
+  const s=[[0,'#cc0000'],[30,'#ff5500'],[50,'#ffcc00'],[70,'#00ffcc'],[85,'#00aaff'],[100,'#0033ff']];
   h=Math.max(0,Math.min(100,h));
   for(let i=1;i<s.length;i++){ const[h0,c0]=s[i-1],[h1,c1]=s[i]; if(h<=h1) return hexToRgb(lerpHex(c0,c1,(h-h0)/(h1-h0))); }
   return hexToRgb(s[s.length-1][1]);
@@ -606,8 +608,34 @@ function initOpacityPopovers() {
       pop.classList.remove('hidden'); activePopover=pop;
     } else { pop.classList.add('hidden'); activePopover=null; }
   }
-  document.getElementById('btnWind').addEventListener('click',function(e){ e.stopPropagation(); openPop(windPop,this); });
-  document.getElementById('btnHum').addEventListener('click', function(e){ e.stopPropagation(); openPop(humPop, this); });
+  document.getElementById('btnWind').addEventListener('click',function(e){
+    e.stopPropagation();
+    /* If popover already open, just close it; otherwise toggle layer + open popover */
+    if(!windPop.classList.contains('hidden')){ windPop.classList.add('hidden'); activePopover=null; return; }
+    /* Toggle wind layer on/off */
+    S.layerWind = !S.layerWind;
+    this.classList.toggle('active', S.layerWind);
+    /* Sync the popover's own toggle button text/state */
+    const pt = windPop.querySelector('.op-toggle');
+    pt.textContent = S.layerWind ? 'VISIBLE' : 'OCULTO';
+    pt.classList.toggle('on', S.layerWind);
+    if(S.layerWind) { startWindParticles(); }
+    else { cancelAnimationFrame(S.windRAF); S.windCtx.clearRect(0,0,S.windCanvas.width,S.windCanvas.height); }
+    /* Also open the popover so user can fine-tune opacity */
+    openPop(windPop, this);
+  });
+  document.getElementById('btnHum').addEventListener('click', function(e){
+    e.stopPropagation();
+    if(!humPop.classList.contains('hidden')){ humPop.classList.add('hidden'); activePopover=null; return; }
+    S.layerHum = !S.layerHum;
+    this.classList.toggle('active', S.layerHum);
+    const pt = humPop.querySelector('.op-toggle');
+    pt.textContent = S.layerHum ? 'VISIBLE' : 'OCULTO';
+    pt.classList.toggle('on', S.layerHum);
+    if(S.layerHum) { if(S.humField) drawHumidityCanvas(); }
+    else { S.humCtx.clearRect(0,0,S.humCanvas.width,S.humCanvas.height); }
+    openPop(humPop, this);
+  });
   document.addEventListener('click',e=>{ if(activePopover&&!activePopover.contains(e.target)){ activePopover.classList.add('hidden'); activePopover=null; } });
   document.getElementById('map-wrap').addEventListener('click',e=>{
     if(activePopover&&!activePopover.contains(e.target)&&!document.getElementById('btnWind').contains(e.target)&&!document.getElementById('btnHum').contains(e.target)){
@@ -974,6 +1002,7 @@ initOpacityPopovers();
       setupGrid();
     }
     populateLocationTag();
+    syncRunButton();  /* set initial disabled state on open */
     animate();
   }
 
@@ -1072,82 +1101,66 @@ initOpacityPopovers();
 
   /* ══════════════════════════════════════════════════════
      MODEL LOADING  (GLB / GLTF / OBJ / STL)
+     All formats use FileReader → loader.parse(buffer/text)
+     — never loader.load(blobURL) which silently hangs at r128.
   ══════════════════════════════════════════════════════ */
   function loadModel(file) {
     setSimStatus('Cargando modelo…', false);
-    const ext  = file.name.split('.').pop().toLowerCase();
-    const url  = URL.createObjectURL(file);
+    const ext = file.name.split('.').pop().toLowerCase();
 
-    /* Remove previous model */
     if (WT.modelMesh) { WT.scene.remove(WT.modelMesh); WT.modelMesh = null; }
     if (WT.envBox)    { WT.scene.remove(WT.envBox);    WT.envBox    = null; }
 
+    /* ── Shared: called with the parsed Three.js object ── */
     const onLoaded = (object) => {
-      URL.revokeObjectURL(url);
-      const mesh = (object.scene || object);  // GLTF has .scene
+      const mesh = (object.scene || object);
 
-      /* Center + normalise scale to fit in a ~6-unit cube */
+      /* Normalise scale to ~6-unit cube */
       const bbox = new THREE.Box3().setFromObject(mesh);
       const size = bbox.getSize(new THREE.Vector3());
-      const maxD = Math.max(size.x, size.y, size.z);
-      const scale = 5 / maxD;
-      mesh.scale.setScalar(scale);
+      const maxD = Math.max(size.x, size.y, size.z) || 1;
+      mesh.scale.setScalar(5 / maxD);
 
-      /* Lift to sit on ground */
-      bbox.setFromObject(mesh);
-      mesh.position.y -= bbox.min.y;
+      /* Sit on ground */
+      const b2 = new THREE.Box3().setFromObject(mesh);
+      mesh.position.y -= b2.min.y;
 
-      /* Material override for STL (no material by default) */
-      if (ext === 'stl') {
-        mesh.traverse(c => {
-          if (c.isMesh) {
-            c.material = new THREE.MeshStandardMaterial({
-              color: 0x2a6080, roughness: 0.55, metalness: 0.3,
-              transparent: true, opacity: 0.85,
-            });
-          }
-        });
-      } else {
-        mesh.traverse(c => {
-          if (c.isMesh) {
-            c.castShadow    = true;
-            c.receiveShadow = true;
-            if (c.material) {
-              c.material.transparent = true;
-              c.material.opacity     = 0.88;
-              if (!c.material.emissive) c.material.emissive = new THREE.Color(0x001428);
-              else c.material.emissive.set(0x001428);
-              c.material.emissiveIntensity = 0.25;
-            }
-          }
-        });
-      }
+      /* Material polish */
+      mesh.traverse(c => {
+        if (!c.isMesh) return;
+        c.castShadow = c.receiveShadow = true;
+        if (!c.material) {
+          c.material = new THREE.MeshStandardMaterial({ color: 0x2a6080, roughness: 0.55, metalness: 0.3, transparent: true, opacity: 0.85 });
+        } else {
+          c.material.transparent = true;
+          c.material.opacity = Math.min(c.material.opacity != null ? c.material.opacity : 1, 0.88);
+          if (!c.material.emissive) c.material.emissive = new THREE.Color(0x001428);
+          else c.material.emissive.set(0x001428);
+          c.material.emissiveIntensity = 0.25;
+        }
+      });
 
       WT.scene.add(mesh);
       WT.modelMesh = mesh;
       WT.modelBBox = new THREE.Box3().setFromObject(mesh);
 
       /* Wireframe envelope */
-      const boxGeo  = new THREE.BoxGeometry();
-      const edges   = new THREE.EdgesGeometry(boxGeo);
-      const boxLine = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x00c8ff, transparent: true, opacity: 0.18 }));
-      const centre  = WT.modelBBox.getCenter(new THREE.Vector3());
-      const sz      = WT.modelBBox.getSize(new THREE.Vector3());
-      boxLine.position.copy(centre);
-      boxLine.scale.set(sz.x * 1.08, sz.y * 1.08, sz.z * 1.08);
-      WT.scene.add(boxLine);
-      WT.envBox = boxLine;
+      const centre = WT.modelBBox.getCenter(new THREE.Vector3());
+      const sz     = WT.modelBBox.getSize(new THREE.Vector3());
+      const edges  = new THREE.EdgesGeometry(new THREE.BoxGeometry(sz.x*1.08, sz.y*1.08, sz.z*1.08));
+      WT.envBox    = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x00c8ff, transparent: true, opacity: 0.18 }));
+      WT.envBox.position.copy(centre);
+      WT.scene.add(WT.envBox);
 
-      /* Fly camera to model */
-      const camDist = maxD * scale * 3.5;
-      WT.camera.position.set(camDist, camDist * 0.6, camDist * 1.2);
+      /* Camera */
+      const cd = maxD * (5/maxD) * 3.5;
+      WT.camera.position.set(cd, cd*0.6, cd*1.2);
       WT.controls.target.copy(centre);
       WT.controls.update();
 
-      /* Update UI */
+      /* UI */
       WT.modelLoaded = true;
-      const bbox2 = new THREE.Box3().setFromObject(mesh);
-      const sz2   = bbox2.getSize(new THREE.Vector3());
+      const sz2 = WT.modelBBox.getSize(new THREE.Vector3());
       document.getElementById('wtModelInfo').textContent =
         `${file.name} · ${sz2.x.toFixed(2)} × ${sz2.y.toFixed(2)} × ${sz2.z.toFixed(2)} m`;
       document.getElementById('wtModelInfo').classList.remove('hidden');
@@ -1155,50 +1168,53 @@ initOpacityPopovers();
       buildFlowField();
       setSimStatus('Modelo listo — ejecuta la simulación', false);
       updateTransforms();
+      syncRunButton();  /* enable Run button now model is loaded */
     };
 
     const onError = (err) => {
-      URL.revokeObjectURL(url);
-      console.error('[WT] Model load error:', err);
-      setSimStatus('Error al cargar modelo', false);
+      console.error('[WT] load error:', err);
+      setSimStatus('Error al cargar: ' + (err.message || err), false);
     };
 
+    const reader = new FileReader();
+
     if (ext === 'glb' || ext === 'gltf') {
-      const loader = new THREE.GLTFLoader();
-      loader.load(url, gltf => onLoaded(gltf), null, onError);
-    } else if (ext === 'obj') {
-      /* OBJLoader needs text content */
-      const reader = new FileReader();
+      /* ArrayBuffer → GLTFLoader.parse() — bypasses XHR/blob entirely */
       reader.onload = e => {
         try {
-          const loader = new THREE.OBJLoader();
-          const obj    = loader.parse(e.target.result);
-          /* OBJ models may lack materials */
+          new THREE.GLTFLoader().parse(e.target.result, '', onLoaded, onError);
+        } catch(err) { onError(err); }
+      };
+      reader.onerror = () => onError(new Error('FileReader failed'));
+      reader.readAsArrayBuffer(file);
+
+    } else if (ext === 'obj') {
+      reader.onload = e => {
+        try {
+          const obj = new THREE.OBJLoader().parse(e.target.result);
           obj.traverse(c => {
-            if (c.isMesh && !c.material) {
+            if (c.isMesh && !c.material)
               c.material = new THREE.MeshStandardMaterial({ color: 0x2a6080, roughness: 0.55, metalness: 0.3 });
-            }
           });
           onLoaded(obj);
         } catch(err) { onError(err); }
       };
-      reader.onerror = onError;
+      reader.onerror = () => onError(new Error('FileReader failed'));
       reader.readAsText(file);
+
     } else if (ext === 'stl') {
-      const reader = new FileReader();
       reader.onload = e => {
         try {
-          const loader   = new THREE.STLLoader();
-          const geometry = loader.parse(e.target.result);
-          geometry.computeVertexNormals();
-          const mat  = new THREE.MeshStandardMaterial({ color: 0x2a6080, roughness: 0.55, metalness: 0.3, transparent: true, opacity: 0.85 });
-          const mesh = new THREE.Mesh(geometry, mat);
+          const geo = new THREE.STLLoader().parse(e.target.result);
+          geo.computeVertexNormals();
+          const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x2a6080, roughness: 0.55, metalness: 0.3, transparent: true, opacity: 0.85 }));
           mesh.castShadow = true;
           onLoaded(mesh);
         } catch(err) { onError(err); }
       };
-      reader.onerror = onError;
+      reader.onerror = () => onError(new Error('FileReader failed'));
       reader.readAsArrayBuffer(file);
+
     } else {
       setSimStatus('Formato no soportado: .' + ext, false);
     }
@@ -1498,7 +1514,8 @@ initOpacityPopovers();
   async function fetchClimate() {
     const btn = document.getElementById('wtFetchData');
     btn.disabled = true;
-    btn.textContent = 'Obteniendo…';
+    /* Show spinner in button */
+    btn.innerHTML = `<span class="wt-btn-spin"></span> CARGANDO…`;
     setSimStatus('Obteniendo datos climáticos…', false);
 
     const month = document.getElementById('wtMonth').value;
@@ -1510,7 +1527,7 @@ initOpacityPopovers();
       WT.climate = { speed: d.speed, dir: d.dir, humidity: d.humidity, temp: d.temp, month };
 
       /* Update wind rose arrow */
-      const arrowDeg = (d.dir + 180) % 360;   // flow-toward direction
+      const arrowDeg = (d.dir + 180) % 360;
       document.getElementById('wtArrowG').setAttribute('transform', `rotate(${arrowDeg},30,30)`);
 
       /* Show climate grid */
@@ -1523,6 +1540,9 @@ initOpacityPopovers();
       ].map(r => `<div class="wtcg-item"><div class="wtcg-k">${r.k}</div><div class="wtcg-v">${r.v}<span class="wtcg-u"> ${r.u}</span></div></div>`).join('');
       grid.classList.remove('hidden');
 
+      /* Enable Run button now that climate data is available */
+      syncRunButton();
+
       buildFlowField();
       setSimStatus(`ICON 13km · ${toDirCard(d.dir)} ${d.speed.toFixed(1)} m/s · HR ${Math.round(d.humidity)}%`, false);
     } catch(err) {
@@ -1532,6 +1552,14 @@ initOpacityPopovers();
       btn.disabled = false;
       btn.innerHTML = `<svg viewBox="0 0 14 14" fill="none" width="12"><path d="M7 2v7M4 6l3 3 3-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><line x1="2" y1="12" x2="12" y2="12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg> OBTENER DATOS DEL MES`;
     }
+  }
+
+  /* Keep Run button disabled until model is loaded */
+  function syncRunButton() {
+    const runBtn = document.getElementById('wtRunSim');
+    const ready  = WT.modelLoaded;
+    runBtn.disabled = !ready;
+    runBtn.title = ready ? 'Ejecutar simulación de flujo de aire' : 'Carga un modelo 3D primero';
   }
 
 
@@ -2043,19 +2071,17 @@ initOpacityPopovers();
   function archLoadModel(file) {
     setArchStatus('LOADING MODEL…', 'running');
     const ext = file.name.split('.').pop().toLowerCase();
-    const url = URL.createObjectURL(file);
 
     if (AS.modelMesh) { AS.scene.remove(AS.modelMesh); AS.modelMesh = null; }
     if (AS.envBox)    { AS.scene.remove(AS.envBox);    AS.envBox    = null; }
 
     const onLoaded = (object) => {
-      URL.revokeObjectURL(url);
       const mesh = object.scene || object;
 
       /* Default normalise: fit in 30m cube */
       const bbox0 = new THREE.Box3().setFromObject(mesh);
       const size0 = bbox0.getSize(new THREE.Vector3());
-      const maxD  = Math.max(size0.x, size0.y, size0.z);
+      const maxD  = Math.max(size0.x, size0.y, size0.z) || 1;
       const norm  = 30 / maxD;
       mesh.scale.setScalar(norm);
 
@@ -2123,13 +2149,21 @@ initOpacityPopovers();
     };
 
     const onError = err => {
-      URL.revokeObjectURL(url);
       console.error('[AS] Model load error:', err);
-      setArchStatus('LOAD ERROR', 'error');
+      setArchStatus('LOAD ERROR: ' + (err.message || err), 'error');
     };
 
+    const reader = new FileReader();
+
     if (ext === 'glb' || ext === 'gltf') {
-      new THREE.GLTFLoader().load(url, gltf => onLoaded(gltf), null, onError);
+      /* ArrayBuffer → GLTFLoader.parse() — bypasses XHR/blob entirely */
+      reader.onload = e => {
+        try {
+          new THREE.GLTFLoader().parse(e.target.result, '', onLoaded, onError);
+        } catch(err) { onError(err); }
+      };
+      reader.onerror = () => onError(new Error('FileReader failed'));
+      reader.readAsArrayBuffer(file);
     } else if (ext === 'obj') {
       const reader = new FileReader();
       reader.onload = e => {
