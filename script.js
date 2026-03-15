@@ -25,7 +25,7 @@
 ══════════════════════════════════════════════════════ */
 const CFG = {
   MT_KEY:         'YU4AkYjwr3SI0k0mKRLc',
-  MT_STYLE:       'https://api.maptiler.com/maps/019cca32-19d8-7506-b7e2-b8e61efa521e/style.json?key=YU4AkYjwr3SI0k0mKRLc',
+  MT_STYLE:       'https://api.maptiler.com/maps/outdoor-v2/style.json?key=YU4AkYjwr3SI0k0mKRLc',
   MT_TERRAIN_URL: 'https://api.maptiler.com/tiles/terrain-rgb-v2/tiles.json?key=YU4AkYjwr3SI0k0mKRLc',
   MT_GEOCODE:     'https://api.maptiler.com/geocoding',
 
@@ -125,74 +125,23 @@ const S = {
 ══════════════════════════════════════════════════════ */
 function initMap() {
   maptilersdk.config.apiKey = CFG.MT_KEY;
-
-  /* ── Safety net: if map never fires 'load' within 12s, show app anyway ── */
-  const safetyTimer = setTimeout(() => {
-    console.warn('[FH] Map load timeout — showing app without terrain');
-    showApp();
-  }, 12000);
-
-  /* ── Try custom style first; fall back to built-in Outdoor on error ── */
-  const styleToUse = CFG.MT_STYLE;
-
   S.map = new maptilersdk.Map({
-    container:'map', style:styleToUse,
+    container:'map', style:CFG.MT_STYLE,
     center:CFG.CENTER, zoom:CFG.ZOOM, pitch:CFG.PITCH, bearing:CFG.BEARING,
     antialias:true,
-    failIfMajorPerformanceCaveat: false,
   });
   S.map.addControl(new maptilersdk.NavigationControl({ visualizePitch:true }), 'bottom-right');
-
+  const _t = setTimeout(()=>{ initCanvases(); showApp(); }, 10000);
   S.map.on('load', () => {
-    clearTimeout(safetyTimer);
-
-    /* Terrain setup — wrapped in try/catch so a source error doesn't block showApp */
-    try {
-      if(!S.map.getSource('mt-dem')) {
-        S.map.addSource('mt-dem', { type:'raster-dem', url:CFG.MT_TERRAIN_URL, tileSize:512, maxzoom:14 });
-      }
-      S.map.setTerrain({ source:'mt-dem', exaggeration:CFG.TERRAIN_EXG });
-    } catch(terrainErr) {
-      console.warn('[FH] Terrain setup failed (continuing without 3D terrain):', terrainErr.message);
-    }
-
-    try {
-      if(!S.map.getLayer('sky')) {
-        S.map.addLayer({ id:'sky', type:'sky', paint:{ 'sky-type':'atmosphere','sky-atmosphere-sun':[0,88],'sky-atmosphere-sun-intensity':10 } });
-      }
-    } catch(skyErr) { /* non-critical */ }
-
+    clearTimeout(_t);
+    try { if(!S.map.getSource('mt-dem')) S.map.addSource('mt-dem', { type:'raster-dem', url:CFG.MT_TERRAIN_URL, tileSize:512, maxzoom:14 }); } catch(e){}
+    try { S.map.setTerrain({ source:'mt-dem', exaggeration:CFG.TERRAIN_EXG }); } catch(e){}
+    try { if(!S.map.getLayer('sky')) S.map.addLayer({ id:'sky', type:'sky', paint:{ 'sky-type':'atmosphere','sky-atmosphere-sun':[0,88],'sky-atmosphere-sun-intensity':10 } }); } catch(e){}
     initCanvases();
     fetchWindField();
     showApp();
   });
-
-  /* If the custom style fails, retry with MapTiler's built-in Outdoor style */
-  S.map.on('error', e => {
-    const msg = e.error?.message || String(e.error || '');
-    console.warn('[FH]', msg);
-
-    /* Detect style-load failures and fall back */
-    if (msg.includes('style') || msg.includes('404') || msg.includes('403')) {
-      clearTimeout(safetyTimer);
-      console.warn('[FH] Style failed — falling back to MapTiler Outdoor');
-      try {
-        S.map.setStyle(`https://api.maptiler.com/maps/outdoor-v2/style.json?key=${CFG.MT_KEY}`);
-        /* Re-attach load handler for fallback style */
-        S.map.once('style.load', () => {
-          try {
-            if(!S.map.getSource('mt-dem'))
-              S.map.addSource('mt-dem', { type:'raster-dem', url:CFG.MT_TERRAIN_URL, tileSize:512, maxzoom:14 });
-            S.map.setTerrain({ source:'mt-dem', exaggeration:CFG.TERRAIN_EXG });
-          } catch(e2) { console.warn('[FH] Fallback terrain:', e2.message); }
-          initCanvases();
-          fetchWindField();
-          showApp();
-        });
-      } catch(fe) { showApp(); } /* last resort */
-    }
-  });
-
+  S.map.on('error', e => { console.warn('[FH]', e?.error?.message||e); });
   S.map.on('click', e => onMapClick(e.lngLat.lat, e.lngLat.lng));
   S.map.getCanvas().style.cursor = 'crosshair';
   S.map.on('moveend', debounce(fetchWindField, 1200));
@@ -926,17 +875,12 @@ function setStatus(state, alt, month, override) {
   }
 }
 
-let _appShown = false;
+let _shown=false;
 function showApp(){
-  if(_appShown) return;
-  _appShown = true;
+  if(_shown)return; _shown=true;
   setTimeout(()=>{
     document.getElementById('loader').classList.add('out');
-    setTimeout(()=>{
-      document.getElementById('loader').style.display='none';
-      document.getElementById('app').classList.remove('hidden');
-      setTimeout(()=>S.map&&S.map.resize(),80);
-    },550);
+    setTimeout(()=>{ document.getElementById('loader').style.display='none'; document.getElementById('app').classList.remove('hidden'); setTimeout(()=>S.map&&S.map.resize(),80); },550);
   },800);
 }
 
