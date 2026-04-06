@@ -164,4 +164,4 @@ fogharvest-v4/
 - **MapTiler + Mapbox GL JS**: MapTiler es totalmente compatible con el renderer de Mapbox GL JS. El `accessToken` de Mapbox se establece como dummy ya que la autenticación real está en las URLs de MapTiler (parámetro `?key=`).
 - **Open-Meteo**: API meteorológica gratuita sin límite de uso razonable. Los datos de viento a 80m/120m solo están disponibles en el bloque `hourly`, no en `current`.
 - **Geocoding**: Endpoint `GET /geocoding/{query}.json?key=...` de MapTiler. Devuelve GeoJSON FeatureCollection con hasta 6 resultados.
-- **Canvases**: El mapa se renderiza en su propio canvas (z-index 1). Encima viven `#hum-canvas` (z-index 2) y `#wind-canvas` (z-index 3), ambos con `pointer-events: none` para no bloquear el mapa.
+- **Canvases**: El mapa se renderiza en su propio canvas (z-index 1). Encima viven `#hum-canvas` (z-index 2) y `#wind-canvas` (z-index 3), ambos con `pointer-events: none` para no bloquear el mapa

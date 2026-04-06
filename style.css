@@ -1,1296 +1,1473 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   FogHarvest  ·  script.js  ·  v8-simulation-fix
-   ─────────────────────────────────────────────────────────────────────
-   BUG FIXES in v8:
-   
-   §1  COORDINATE SPACE MISMATCH (CRITICAL):
-        The flow field domain was defined based on model BBox center/size,
-        but particles and mesh were at different reference points.
-        FIX: When building flow field, center domain around 0,0,0 so mesh
-        and particles exist in same world-space. Offset inlet correctly
-        relative to global origin, not model center.
-   
-   §2  RACE CONDITION — model loading vs. simulation:
-        runArchSim() called buildArchFlowField() immediately without
-        waiting for model to fully load. Three.js geometries need
-        bounding box to be finalized first.
-        FIX: Add 200ms delay in runArchSim() before any flow field ops.
-        Add modelLoaded flag checks in all sim-dependent functions.
-   
-   §3  MEMORY LEAK — old particle system not cleaned:
-        Calling runArchSim() multiple times left old particle geometry
-        in memory. THREE.BufferGeometry needs explicit .dispose().
-        FIX: Call dispose() on old geometry before removing from scene.
-   
-   §4  UNSUPPORTED FORMAT ERROR HANDLING:
-        Unsupported file formats were caught, but no UI feedback after
-        dismissal. User could click "Run Sim" on empty scene.
-        FIX: Clear modelLoaded flag when format error occurs.
-   
-   §5  PRESSURE MESH NOT RESETTING:
-        When switching view modes or resetting sim, pressure mesh was
-        not cleaned up properly, causing memory bloat and visual glitches.
-        FIX: Always call dispose() and remove from scene before
-        rebuilding pressure mesh.
-   
-   §6  SIMULATION STATE NOT RESET BETWEEN RUNS:
-        Particles, flow grid, and climate data persisted incorrectly.
-        Multiple runs caused particle trails to accumulate garbage.
-        FIX: Clear particle trails and reset state in resetArchSim().
-   
-   §7  PROGRESS/STATUS FEEDBACK TIMING:
-        Status "BUILDING FLOW FIELD" appeared even if flow field build
-        failed silently. User saw "SIM ACTIVE" after 2.5s even if empty.
-        FIX: Add try-catch around buildArchFlowField(), explicit error
-        messaging. Verify flowGrid exists before claiming sim is ready.
-   
-   §8  MODEL VISIBILITY IN ORTHOGONAL VIEWS:
-        When user switched to pressure view, particle streamlines
-        disappeared but model wasn't repositioned. Looked like sim failed.
-        FIX: Ensure camera refits to model when switching views.
-   
+   FogHarvest · style.css  — complete stylesheet
+   Covers: main map shell, topbar, analysis panel, opacity popovers,
+           3D Wind Tunnel modal overlay, all UI components.
 ═══════════════════════════════════════════════════════════════════════ */
 
+/* ── TOKENS ───────────────────────────────────────────────────────── */
+:root {
+  --bg:        #060c18;
+  --surface:   #0a1120;
+  --surface2:  #0e1930;
+  --border:    rgba(255,255,255,0.07);
+  --border2:   rgba(0,200,255,0.18);
+  --accent:    #00c8ff;
+  --accent2:   #00ffaa;
+  --mute:      #3a4460;
+  --text:      #dde2ee;
+  --text2:     rgba(255,255,255,0.45);
+  --danger:    #ff4466;
+  --warn:      #ffb830;
+  --radius:    6px;
+  --panel-w:   310px;
+  --topbar-h:  46px;
+  --font-mono: 'DM Mono', 'Courier New', monospace;
+  --font-head: 'Syne', sans-serif;
+}
 
-/* ══════════════════════════════════════════════════════════════════════
-   1. CONFIG
-══════════════════════════════════════════════════════════════════════ */
-const CFG = {
-  MT_KEY:         'YU4AkYjwr3SI0k0mKRLc',
-  MT_STYLE:       'https://api.maptiler.com/maps/outdoor-v2/style.json?key=YU4AkYjwr3SI0k0mKRLc',
-  MT_TERRAIN_URL: 'https://api.maptiler.com/tiles/terrain-rgb-v2/tiles.json?key=YU4AkYjwr3SI0k0mKRLc',
-  MT_GEOCODE:     'https://api.maptiler.com/geocoding',
-
-  CENTER:      [-116.94, 32.52],
-  ZOOM:        11.5,
-  PITCH:       58,
-  BEARING:     -18,
-  TERRAIN_EXG: 1.5,
-
-  /* ── Weather API endpoints ───────────────────────── */
-  API_ICON:    'https://api.open-meteo.com/v1/icon',
-  API_GFS:     'https://api.open-meteo.com/v1/gfs',
-  API_ARCHIVE: 'https://archive-api.open-meteo.com/v1/archive',
-
-  HOURLY_VARS: [
-    'wind_speed_10m',
-    'wind_direction_10m',
-    'wind_speed_80m',
-    'wind_direction_80m',
-    'wind_speed_120m',
-    'wind_direction_120m',
-    'relative_humidity_2m',
-    'temperature_2m',
-  ].join(','),
-
-  ARCHIVE_VARS: [
-    'wind_speed_10m',
-    'wind_direction_10m',
-    'wind_speed_80m',
-    'wind_direction_80m',
-    'wind_speed_120m',
-    'wind_direction_120m',
-    'relative_humidity_2m',
-    'temperature_2m',
-    'cloud_cover',
-    'precipitation',
-  ].join(','),
-
-  COAST_RADIUS_KM: 30,
-  GRID: { COLS: 14, ROWS: 10 },
-
-  API_DELAY_MS:  1200,
-  API_RETRY_MS:  4000,
-  API_MAX_RETRY: 2,
-
-  WIND: {
-    PARTICLE_COUNT: 2200,
-    FADE:       0.96,
-    SPEED_SCALE: 0.13,
-    LINE_WIDTH:  1.8,
-    MAX_AGE:     160,
-    MAX_ALPHA:   0.82,
-    MIN_ALPHA:   0.32,
-  },
-
-  F: {
-    FOG_H:92, FOG_M:78,
-    ELV_HI_MIN:180, ELV_HI_MAX:850, ELV_ME_MIN:40, ELV_ME_MAX:180,
-    WIN_HI_MIN:3,   WIN_HI_MAX:13,  WIN_ME_MIN:1,  WIN_ME_MAX:18,
-    CST_HI:5, CST_ME:20,
-  },
-
-  Y: {
-    EFFICIENCY:0.20, FOG_HOURS:8,
-    LWC_RH_MIN:80, LWC_RH_MED:90, LWC_RH_HI:95, LWC_CAP:3.0,
-    ELV_OPTIMAL_MIN:180, ELV_OPTIMAL_MAX:850, ELV_PEN_ABOVE:900,
-  },
-};
+/* ── RESET ────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font-mono); font-size: 12px; -webkit-font-smoothing: antialiased; }
+button { cursor: pointer; border: none; background: none; font-family: inherit; font-size: inherit; color: inherit; }
+select, input { font-family: inherit; font-size: inherit; color: var(--text); background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); outline: none; }
+select { cursor: pointer; }
+select:focus, input:focus { border-color: var(--border2); }
+.hidden { display: none !important; }
 
 
-/* ══════════════════════════════════════════════════════════════════════
-   2. STATE
-══════════════════════════════════════════════════════════════════════ */
-const S = {
-  map:null, marker:null,
-  windField:null, windParticles:[], windCanvas:null, windCtx:null, windRAF:null,
-  humField:null,  humCanvas:null,   humCtx:null,
-  gridSamples:[],
-  selectedPoint:null, weather:null, feasibility:null, coastDist:null, waterYield:null,
-  selectedMonth:'current',
-  layerWind:true, layerHum:true,
-  windOpacity:1.0, humOpacity:0.57,
-  monthChart:null, panelOpen:true, searchTimer:null,
-  apiCache:  new Map(),
-  apiQueue:  Promise.resolve(),
-
-  activeModel: 'ICON',
-  activeHour:  null,
-};
+/* ════════════════════════════════════════════════════════
+   LOADER
+════════════════════════════════════════════════════════ */
+#loader {
+  position: fixed; inset: 0; z-index: 900;
+  background: var(--bg);
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity 0.5s ease;
+}
+#loader.out { opacity: 0; pointer-events: none; }
+.ld-inner { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.ld-icon { width: 56px; height: 56px; color: var(--accent); animation: ldSpin 4s linear infinite; }
+@keyframes ldSpin { to { transform: rotate(360deg); } }
+.ld-label { font-size: 10px; letter-spacing: 2.5px; color: var(--text2); }
+.ld-bar { width: 140px; height: 2px; background: var(--surface2); border-radius: 2px; overflow: hidden; }
+.ld-fill { width: 40%; height: 100%; background: var(--accent); animation: ldFill 1.6s ease-in-out infinite alternate; }
+@keyframes ldFill { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
 
 
-/* ══════════════════════════════════════════════════════════════════════
-   3. MAP INIT
-══════════════════════════════════════════════════════════════════════ */
-function initMap() {
-  maptilersdk.config.apiKey = CFG.MT_KEY;
-  S.map = new maptilersdk.Map({
-    container:'map', style:CFG.MT_STYLE,
-    center:CFG.CENTER, zoom:CFG.ZOOM, pitch:CFG.PITCH, bearing:CFG.BEARING,
-    antialias:true,
-  });
-  S.map.addControl(new maptilersdk.NavigationControl({ visualizePitch:true }), 'bottom-right');
-  const _t = setTimeout(()=>{ initCanvases(); showApp(); }, 10000);
-  S.map.on('load', () => {
-    clearTimeout(_t);
-    try { if(!S.map.getSource('mt-dem')) S.map.addSource('mt-dem', { type:'raster-dem', url:CFG.MT_TERRAIN_URL, tileSize:512, maxzoom:14 }); } catch(e){}
-    try { S.map.setTerrain({ source:'mt-dem', exaggeration:CFG.TERRAIN_EXG }); } catch(e){}
-    try { if(!S.map.getLayer('sky')) S.map.addLayer({ id:'sky', type:'sky', paint:{ 'sky-type':'atmosphere','sky-atmosphere-sun':[0,88],'sky-atmosphere-sun-intensity':10 } }); } catch(e){}
-    initCanvases();
-    fetchWindField();
-    showApp();
-  });
-  S.map.on('error', e => { console.warn('[FH]', e?.error?.message||e); });
-  S.map.on('click', e => onMapClick(e.lngLat.lat, e.lngLat.lng));
-  S.map.getCanvas().style.cursor = 'crosshair';
-  S.map.on('moveend', debounce(fetchWindField, 1200));
-  S.map.on('resize', () => {
-    syncCanvasSize(S.windCanvas); syncCanvasSize(S.humCanvas);
-    if(S.humField) drawHumidityCanvas();
-  });
+/* ════════════════════════════════════════════════════════
+   APP SHELL
+════════════════════════════════════════════════════════ */
+#app { display: flex; flex-direction: column; width: 100%; height: 100%; }
+
+
+/* ════════════════════════════════════════════════════════
+   TOP BAR
+════════════════════════════════════════════════════════ */
+#topbar {
+  height: var(--topbar-h);
+  background: rgba(6,12,24,0.96);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 14px; gap: 10px; flex-shrink: 0; z-index: 40;
+}
+
+/* Brand */
+.brand { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.brand svg { width: 20px; height: 20px; color: var(--accent); }
+.brand-name { font-family: var(--font-head); font-size: 14px; font-weight: 800;
+              letter-spacing: 0.5px; color: white; }
+.brand-sep  { color: var(--mute); font-size: 11px; }
+.brand-sub  { font-size: 9px; letter-spacing: 1.5px; color: var(--text2); }
+
+/* Controls row */
+.tb-controls { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
+.ctrl-group { display: flex; align-items: center; gap: 5px; }
+.ctrl-label { font-size: 8px; letter-spacing: 1.8px; color: var(--text2); white-space: nowrap; }
+.ctrl-group select { padding: 3px 6px; font-size: 10px; }
+
+/* Layer buttons */
+.layer-btns { display: flex; gap: 3px; }
+.lbtn {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 8px; border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text2); font-size: 9px; letter-spacing: 1px;
+  transition: all 0.18s; position: relative;
+}
+.lbtn svg { width: 14px; height: 14px; }
+/* ON state: bright, clearly active */
+.lbtn.active {
+  border-color: var(--accent);
+  color: #fff;
+  background: rgba(0,200,255,0.18);
+  box-shadow: 0 0 10px rgba(0,200,255,0.25), inset 0 0 0 1px rgba(0,200,255,0.3);
+}
+/* OFF state: clearly dimmed */
+.lbtn:not(.active) { opacity: 0.55; }
+.lbtn:hover { opacity: 1; border-color: rgba(0,200,255,0.4); color: var(--accent); }
+
+/* Tooltip via data-tip attribute */
+[data-tip] { position: relative; }
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute; bottom: calc(100% + 7px); left: 50%; transform: translateX(-50%);
+  background: rgba(8,12,22,0.97); color: var(--text);
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.5px;
+  padding: 5px 9px; border-radius: 5px; border: 1px solid var(--border2);
+  white-space: nowrap; pointer-events: none;
+  opacity: 0; transition: opacity 0.15s 0.3s;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.6); z-index: 300;
+}
+[data-tip]:hover::after { opacity: 1; }
+
+/* Refresh button */
+.btn-refresh {
+  display: flex; align-items: center; gap: 5px;
+  padding: 4px 10px; border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text2); font-size: 9px; letter-spacing: 1px;
+  transition: all 0.15s;
+}
+.btn-refresh svg { width: 14px; height: 14px; }
+.btn-refresh:hover { border-color: var(--border2); color: var(--accent); }
+
+/* 3D Tunnel button */
+.btn-tunnel {
+  display: flex; align-items: center; gap: 5px;
+  padding: 4px 11px; border-radius: var(--radius);
+  border: 1px solid rgba(0,200,255,0.35);
+  background: rgba(0,200,255,0.08);
+  color: var(--accent); font-size: 9px; letter-spacing: 1.2px;
+  transition: all 0.15s; white-space: nowrap;
+}
+.btn-tunnel svg { width: 15px; height: 15px; }
+.btn-tunnel:hover { background: rgba(0,200,255,0.15); border-color: var(--accent); box-shadow: 0 0 12px rgba(0,200,255,0.2); }
+
+/* Panel toggle icon */
+.btn-icon {
+  width: 30px; height: 30px; border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text2);
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.15s;
+}
+.btn-icon svg { width: 14px; height: 14px; }
+.btn-icon:hover { border-color: var(--border2); color: var(--accent); }
+
+
+/* ════════════════════════════════════════════════════════
+   SEARCH
+════════════════════════════════════════════════════════ */
+.search-wrap {
+  position: relative; display: flex; align-items: center;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 0 8px; gap: 6px;
+  transition: border-color 0.15s;
+}
+.search-wrap:focus-within { border-color: var(--border2); }
+.search-icon { width: 12px; height: 12px; color: var(--mute); flex-shrink: 0; }
+#searchInput {
+  background: none; border: none; outline: none;
+  width: 150px; padding: 5px 0; font-size: 11px;
+  color: var(--text); placeholder-color: var(--mute);
+}
+#searchInput::placeholder { color: var(--mute); }
+.search-clear {
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--mute); color: white; opacity: 0.7;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; transition: opacity 0.15s;
+}
+.search-clear:hover { opacity: 1; }
+.search-clear svg { width: 8px; height: 8px; }
+.search-dropdown {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 200;
+  background: rgba(10,17,32,0.98);
+  border: 1px solid var(--border2); border-radius: var(--radius);
+  overflow: hidden; backdrop-filter: blur(16px);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.7);
+  max-height: 280px; overflow-y: auto;
+}
+.search-item {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 9px 12px; cursor: pointer; border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+.search-item:last-child { border-bottom: none; }
+.search-item:hover, .search-item.active { background: rgba(0,200,255,0.07); }
+.si-name  { font-size: 11px; color: var(--text); }
+.si-place { font-size: 9px; color: var(--text2); }
+.si-coords{ font-size: 9px; color: var(--mute); letter-spacing: 0.5px; }
+.search-loading, .search-no-results { padding: 12px; text-align: center; color: var(--text2); font-size: 10px; }
+
+
+/* ════════════════════════════════════════════════════════
+   MAIN LAYOUT
+════════════════════════════════════════════════════════ */
+#main {
+  flex: 1; display: flex; overflow: hidden;
+  height: calc(100vh - var(--topbar-h));
+}
+
+/* MAP WRAP */
+#map-wrap { flex: 1; position: relative; overflow: hidden; }
+#map { position: absolute; inset: 0; }
+
+/* Canvas overlays */
+#hum-canvas, #wind-canvas {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  pointer-events: none; z-index: 2;
+}
+#wind-canvas { z-index: 3; }
+
+/* Status bar */
+#status-bar {
+  position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+  z-index: 10; background: rgba(6,12,24,0.82); backdrop-filter: blur(8px);
+  border: 1px solid var(--border); border-radius: 20px;
+  padding: 4px 12px; display: flex; align-items: center; gap: 7px;
+  font-size: 9px; letter-spacing: 1.5px; color: var(--text2); white-space: nowrap;
+}
+.st-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--mute); transition: background 0.3s; }
+.st-dot.on  { background: var(--accent2); box-shadow: 0 0 8px var(--accent2); animation: pulse 2s ease-in-out infinite; }
+.st-dot.err { background: var(--danger); }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+
+/* Legend */
+#legend {
+  position: absolute; bottom: 44px; left: 12px; z-index: 10;
+  background: rgba(6,12,24,0.82); backdrop-filter: blur(8px);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 5px;
+}
+.leg-row { display: flex; align-items: center; gap: 7px; }
+.leg-title { font-size: 8px; letter-spacing: 1.5px; color: var(--text2); width: 46px; flex-shrink: 0; }
+.leg-wind-bar {
+  width: 80px; height: 5px; border-radius: 3px;
+  background: linear-gradient(to right, #6600ff, #0055ff, #00ccff, #00ffbb, #ccff00, #ffdd00, #ff2200);
+}
+.leg-hum-bar {
+  width: 80px; height: 5px; border-radius: 3px;
+  background: linear-gradient(to right, #cc0000, #ff5500, #ffcc00, #00ffcc, #00aaff, #0033ff);
+}
+.leg-wind-labels, .leg-hum-labels {
+  display: flex; gap: 6px; font-size: 7.5px; color: var(--mute);
+}
+.leg-unit { color: var(--mute); }
+.leg-sep { height: 1px; background: var(--border); }
+
+/* Click hint */
+#click-hint {
+  position: absolute; bottom: 44px; right: 12px; z-index: 10;
+  background: rgba(6,12,24,0.82); backdrop-filter: blur(8px);
+  border: 1px solid var(--border); border-radius: 20px;
+  padding: 5px 12px; display: flex; align-items: center; gap: 6px;
+  font-size: 9px; letter-spacing: 1px; color: var(--text2);
+}
+#click-hint svg { width: 12px; height: 12px; }
+
+/* Compass */
+#compass {
+  position: absolute; top: 12px; right: 52px; z-index: 10;
+  pointer-events: none;
+}
+#compass svg { width: 44px; height: 44px; }
+
+
+/* ════════════════════════════════════════════════════════
+   ANALYSIS PANEL
+════════════════════════════════════════════════════════ */
+#panel {
+  width: var(--panel-w); flex-shrink: 0;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden;
+  transition: width 0.3s ease, opacity 0.3s ease;
+}
+#panel.collapsed { width: 0; opacity: 0; overflow: hidden; }
+
+#panel-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px; }
+#panel-scroll::-webkit-scrollbar { width: 4px; }
+#panel-scroll::-webkit-scrollbar-thumb { background: var(--mute); border-radius: 2px; }
+
+/* Panel section */
+.ps { margin-bottom: 18px; }
+.ps-label {
+  font-size: 8px; letter-spacing: 2px; color: var(--text2);
+  border-bottom: 1px solid var(--border); padding-bottom: 5px; margin-bottom: 10px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+
+/* Empty state */
+#p-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  padding: 30px 16px; text-align: center; color: var(--text2);
+  font-size: 11px; line-height: 1.6;
+}
+.p-empty-icon svg { width: 60px; height: 60px; color: var(--mute); }
+.p-empty-sub { font-size: 9px; color: var(--mute); }
+
+/* Loading */
+#p-loading {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  padding: 30px; color: var(--text2); font-size: 10px; letter-spacing: 1px;
+}
+.p-spin {
+  width: 24px; height: 24px; border: 2px solid var(--border);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Coordinates grid */
+.coord-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.crd { background: var(--surface2); border-radius: var(--radius); padding: 7px 9px; }
+.crd-k { display: block; font-size: 7.5px; letter-spacing: 1.5px; color: var(--mute); margin-bottom: 3px; }
+.crd-v { display: block; font-size: 11px; color: var(--text); font-weight: 500; }
+
+/* Score arc */
+.score-wrap { display: flex; align-items: center; gap: 14px; }
+.score-svg  { width: 90px; height: 90px; flex-shrink: 0; }
+.score-meta { flex: 1; }
+.score-label { font-family: var(--font-head); font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+.score-limit { font-size: 9px; color: var(--warn); line-height: 1.4; }
+
+/* Yield box */
+.yield-box  { display: flex; align-items: baseline; gap: 6px; margin-bottom: 8px; }
+.yield-n    { font-family: var(--font-head); font-size: 28px; font-weight: 800; color: var(--accent); }
+.yield-u    { font-size: 10px; color: var(--text2); }
+.yield-detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-bottom: 7px; }
+.yd-item { background: var(--surface2); border-radius: var(--radius); padding: 6px 8px; }
+.yd-k    { font-size: 7.5px; letter-spacing: 1px; color: var(--mute); margin-bottom: 3px; }
+.yd-v    { font-size: 11px; color: var(--text); }
+.yd-u    { font-size: 8.5px; color: var(--text2); margin-left: 2px; }
+.yield-note { font-size: 9px; color: var(--text2); font-style: italic; }
+
+/* Factor bars */
+.factor-item { background: var(--surface2); border-radius: var(--radius); padding: 8px 10px; margin-bottom: 5px; border: 1px solid transparent; }
+.factor-item.lim { border-color: rgba(255,184,48,0.3); }
+.fi-top  { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+.fi-name { font-size: 9.5px; color: var(--text); }
+.fi-badge { font-size: 8px; letter-spacing: 1px; padding: 2px 7px; border-radius: 10px; }
+.fi-badge.high { background: rgba(0,255,170,0.12); color: var(--accent2); }
+.fi-badge.med  { background: rgba(0,200,255,0.12); color: var(--accent);  }
+.fi-badge.low  { background: rgba(255,68,102,0.12); color: var(--danger); }
+.fi-bar  { height: 3px; background: rgba(255,255,255,0.07); border-radius: 2px; margin-bottom: 5px; overflow: hidden; }
+.fi-bar-fill { height: 100%; border-radius: 2px; transition: width 0.9s cubic-bezier(0.4,0,0.2,1); }
+.fi-bar-fill.high { background: linear-gradient(to right, #00c8ff, #00ffaa); }
+.fi-bar-fill.med  { background: linear-gradient(to right, #0066ff, #00c8ff); }
+.fi-bar-fill.low  { background: linear-gradient(to right, #ff2244, #ff6688); }
+.fi-detail { font-size: 8.5px; color: var(--text2); }
+
+/* ATM grid */
+.atm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.atm-item { background: var(--surface2); border-radius: var(--radius); padding: 6px 8px; }
+.atm-k    { font-size: 7.5px; letter-spacing: 1px; color: var(--mute); margin-bottom: 3px; }
+.atm-v    { font-size: 12px; color: var(--text); font-weight: 500; }
+.atm-u    { font-size: 8.5px; color: var(--text2); margin-left: 2px; }
+
+/* Monthly chart */
+.chart-box  { height: 80px; position: relative; margin-bottom: 4px; }
+.chart-note { font-size: 8px; color: var(--mute); letter-spacing: 0.5px; }
+.badge-loading {
+  font-size: 7.5px; background: rgba(0,200,255,0.12);
+  color: var(--accent); padding: 2px 7px; border-radius: 10px; letter-spacing: 1px;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+/* Export buttons */
+.exp-btns { display: flex; gap: 6px; }
+.exp-btn {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 8px 4px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text2); font-size: 8.5px; letter-spacing: 1px;
+  transition: all 0.15s;
+}
+.exp-btn svg { width: 16px; height: 16px; }
+.exp-btn:hover { border-color: var(--border2); color: var(--accent); background: rgba(0,200,255,0.07); }
+
+
+/* ════════════════════════════════════════════════════════
+   OPACITY POPOVERS (layer controls)
+════════════════════════════════════════════════════════ */
+.op-popover {
+  position: absolute; z-index: 120;
+  background: rgba(8,12,20,0.97);
+  border: 1px solid rgba(0,200,255,0.22); border-radius: 8px;
+  padding: 12px 14px; min-width: 210px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.7);
+  backdrop-filter: blur(12px);
+  animation: popIn 0.15s cubic-bezier(0.34,1.56,0.64,1);
+}
+@keyframes popIn { from { opacity:0; transform:translateY(6px) scale(0.97); } to { opacity:1; transform:none; } }
+.op-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.op-title  { font-size: 9px; letter-spacing: 1.5px; color: var(--text2); text-transform: uppercase; }
+.op-toggle {
+  font-size: 8px; letter-spacing: 1px; padding: 3px 8px;
+  border-radius: 3px; border: 1px solid rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.05); color: var(--text2); transition: all 0.15s;
+}
+.op-toggle.on { border-color: rgba(0,200,255,0.5); color: var(--accent); background: rgba(0,200,255,0.08); }
+.op-row { display: flex; align-items: center; gap: 8px; }
+.op-row svg { flex-shrink: 0; color: var(--text2); }
+.op-slider { flex: 1; -webkit-appearance: none; appearance: none; height: 3px; background: rgba(255,255,255,0.12); border-radius: 2px; }
+.op-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 2px solid rgba(8,12,20,0.9); box-shadow: 0 0 6px rgba(0,200,255,0.5); cursor: pointer; }
+.op-pct { font-size: 9px; color: var(--accent); width: 28px; text-align: right; flex-shrink: 0; }
+
+
+/* ════════════════════════════════════════════════════════
+   3D WIND TUNNEL OVERLAY
+════════════════════════════════════════════════════════ */
+#wt-overlay {
+  position: fixed; inset: 0; z-index: 500;
+  background: rgba(2, 6, 14, 0.88);
+  backdrop-filter: blur(10px);
+  display: flex; align-items: center; justify-content: center;
+  animation: wtFadeIn 0.2s ease;
+}
+#wt-overlay.wt-hidden { display: none; }
+@keyframes wtFadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+/* Modal box */
+#wt-modal {
+  width: min(98vw, 1340px);
+  height: min(94vh, 840px);
+  background: var(--surface);
+  border: 1px solid rgba(0,200,255,0.18);
+  border-radius: 10px;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.85), 0 0 0 1px rgba(255,255,255,0.04);
+  animation: wtSlideIn 0.22s cubic-bezier(0.34,1.3,0.64,1);
+}
+@keyframes wtSlideIn { from { transform: scale(0.96) translateY(10px); opacity:0; } to { transform: none; opacity:1; } }
+
+/* ── MODAL HEADER ── */
+#wt-header {
+  height: 44px; flex-shrink: 0;
+  background: rgba(6,12,24,0.95);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 16px;
+}
+.wt-brand { display: flex; align-items: center; gap: 10px; }
+.wt-title { font-size: 10px; letter-spacing: 2.5px; color: var(--text2); font-family: var(--font-mono); }
+.wt-loc-tag {
+  font-size: 9px; letter-spacing: 0.5px; color: var(--accent);
+  background: rgba(0,200,255,0.08); border: 1px solid rgba(0,200,255,0.2);
+  border-radius: 10px; padding: 2px 10px;
+}
+.wt-close-btn {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: rgba(255,255,255,0.05); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text2); transition: all 0.15s;
+}
+.wt-close-btn:hover { background: rgba(255,68,102,0.15); border-color: var(--danger); color: var(--danger); }
+.wt-close-btn svg { width: 12px; height: 12px; }
+
+/* ── MODAL BODY ── */
+#wt-body { flex: 1; display: flex; overflow: hidden; }
+
+/* ── THREE.JS VIEWPORT ── */
+#wt-viewport {
+  flex: 1; position: relative; overflow: hidden;
+  background: #060c18;
+  border-right: 1px solid var(--border);
+}
+#wt-canvas { display: block; width: 100%; height: 100%; }
+
+/* Viewport hint */
+#wt-controls-hint {
+  position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+  font-size: 8.5px; letter-spacing: 1.2px; color: rgba(255,255,255,0.3);
+  background: rgba(0,0,0,0.4); border-radius: 20px; padding: 4px 14px;
+  pointer-events: none; white-space: nowrap;
+}
+
+/* Simulation status */
+#wt-sim-status {
+  position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+  font-size: 10px; letter-spacing: 1px; color: var(--text);
+  background: rgba(6,12,24,0.88); border: 1px solid var(--border2);
+  border-radius: 20px; padding: 5px 16px;
+  backdrop-filter: blur(8px); white-space: nowrap;
+  transition: opacity 0.3s;
+}
+.wt-status-hidden { display: none; }
+
+/* Wind rose */
+#wt-wind-rose {
+  position: absolute; top: 14px; right: 14px;
+  pointer-events: none;
+}
+
+/* Speed colorbar */
+#wt-colorbar {
+  position: absolute; bottom: 36px; right: 14px;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+}
+.wcb-gradient {
+  width: 12px; height: 80px; border-radius: 6px;
+  background: linear-gradient(to bottom, #ff3300, #ffcc00, #00ffaa, #00c8ff, #1a3aff);
+  border: 1px solid rgba(255,255,255,0.1);
+}
+.wcb-labels { display: flex; flex-direction: column; align-items: center; gap: 52px; }
+.wcb-labels span { font-size: 7.5px; color: var(--text2); letter-spacing: 0.5px; }
+
+/* ── SIDE CONTROL PANEL ── */
+#wt-panel {
+  width: 290px; flex-shrink: 0;
+  background: var(--surface);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#wt-panel-scroll {
+  flex: 1; overflow-y: auto; overflow-x: hidden; padding: 14px 12px;
+}
+#wt-panel-scroll::-webkit-scrollbar { width: 3px; }
+#wt-panel-scroll::-webkit-scrollbar-thumb { background: var(--mute); border-radius: 2px; }
+
+/* Panel section */
+.wtp-section {
+  margin-bottom: 20px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+}
+.wtp-section:last-child { border-bottom: none; }
+.wtp-hidden { display: none; }
+
+.wtp-label {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 8px; letter-spacing: 2px; color: var(--text2);
+  margin-bottom: 10px;
+}
+.wtp-label svg { flex-shrink: 0; color: var(--accent); opacity: 0.7; }
+
+/* Drop zone */
+.wt-dropzone {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 16px 12px; border: 1.5px dashed rgba(0,200,255,0.25);
+  border-radius: 8px; cursor: pointer; text-align: center;
+  background: rgba(0,200,255,0.03); transition: all 0.2s; color: var(--text2);
+}
+.wt-dropzone:hover, .wt-dropzone.drag {
+  border-color: rgba(0,200,255,0.6);
+  background: rgba(0,200,255,0.07);
+  color: var(--accent);
+}
+.wt-dropzone svg { color: var(--text2); opacity: 0.4; }
+.wt-dz-main { font-size: 10px; letter-spacing: 0.5px; }
+.wt-dz-sub  { font-size: 8.5px; color: var(--mute); letter-spacing: 1px; }
+
+/* Model info */
+.wt-model-info {
+  margin-top: 8px; padding: 8px 10px;
+  background: var(--surface2); border-radius: var(--radius);
+  font-size: 9.5px; color: var(--text); line-height: 1.6;
+  border-left: 2px solid var(--accent2);
+}
+.wt-model-info b { color: var(--accent2); }
+
+/* Slider rows */
+.wt-slider-row {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 7px;
+}
+.wts-lbl  { font-size: 8px; letter-spacing: 1.2px; color: var(--mute); width: 46px; flex-shrink: 0; }
+.wts-val  { font-size: 10px; color: var(--accent); width: 34px; text-align: right; flex-shrink: 0; }
+.wts-tiny { font-size: 7.5px; color: var(--mute); }
+.wt-slider {
+  flex: 1; -webkit-appearance: none; appearance: none;
+  height: 3px; background: rgba(255,255,255,0.1); border-radius: 2px; outline: none;
+}
+.wt-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); border: 2px solid rgba(8,12,20,0.9);
+  box-shadow: 0 0 5px rgba(0,200,255,0.45); cursor: pointer;
+}
+
+/* Control row */
+.wt-ctrl-row {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+}
+.wt-area-row { display: flex; align-items: center; gap: 6px; flex: 1; }
+.wt-num-input {
+  width: 68px; padding: 4px 7px; font-size: 10px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); outline: none;
+}
+.wt-num-input:focus { border-color: var(--border2); }
+
+/* Select */
+.wt-select {
+  flex: 1; padding: 4px 7px; font-size: 10px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); outline: none;
+}
+.wt-select:focus { border-color: var(--border2); }
+
+/* Buttons */
+.wt-btn {
+  width: 100%; display: flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 8px 12px; border-radius: var(--radius);
+  font-size: 9px; letter-spacing: 1.5px; font-family: var(--font-mono);
+  transition: all 0.15s; margin-top: 6px;
+}
+.wt-btn-pri {
+  background: rgba(0,200,255,0.15);
+  border: 1px solid rgba(0,200,255,0.45);
+  color: var(--accent);
+}
+.wt-btn-pri:hover:not(:disabled) { background: rgba(0,200,255,0.25); box-shadow: 0 0 14px rgba(0,200,255,0.2); }
+/* Run button: green when ready, clearly disabled when not */
+#wtRunSim:not(:disabled) {
+  background: rgba(0,255,170,0.14);
+  border-color: rgba(0,255,170,0.55);
+  color: var(--accent2);
+  box-shadow: 0 0 10px rgba(0,255,170,0.12);
+}
+#wtRunSim:not(:disabled):hover {
+  background: rgba(0,255,170,0.24);
+  box-shadow: 0 0 18px rgba(0,255,170,0.22);
+}
+.wt-btn-pri:disabled,
+.wt-btn-sec:disabled { opacity: 0.3; cursor: not-allowed; filter: grayscale(0.5); }
+.wt-btn-sec {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text2);
+}
+.wt-btn-sec:hover:not(:disabled) { border-color: var(--border2); color: var(--accent); }
+
+/* Fetch button spinner */
+.wt-btn-spin {
+  display: inline-block; width: 10px; height: 10px;
+  border: 1.5px solid rgba(0,200,255,0.3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+/* Climate data grid */
+.wt-climate-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 8px;
+}
+.wtcg-item { background: var(--surface2); border-radius: var(--radius); padding: 7px 9px; }
+.wtcg-k    { font-size: 7.5px; letter-spacing: 1px; color: var(--mute); margin-bottom: 3px; }
+.wtcg-v    { font-size: 13px; color: var(--accent); font-weight: 500; }
+.wtcg-u    { font-size: 8.5px; color: var(--text2); margin-left: 2px; }
+
+/* Results grid */
+.wt-results-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-bottom: 12px;
+}
+.wtrg-item { background: var(--surface2); border-radius: var(--radius); padding: 7px 9px; }
+.wtrg-k    { font-size: 7.5px; letter-spacing: 1px; color: var(--mute); margin-bottom: 3px; }
+.wtrg-v    { font-size: 13px; color: var(--text); font-weight: 500; }
+.wtrg-u    { font-size: 8.5px; color: var(--text2); margin-left: 2px; }
+
+/* Harvest highlight box */
+.wt-harvest-box {
+  background: linear-gradient(135deg, rgba(0,200,255,0.06), rgba(0,255,170,0.06));
+  border: 1px solid rgba(0,255,170,0.25);
+  border-radius: 8px; padding: 14px 12px; text-align: center;
+}
+.wt-harvest-num  { font-family: var(--font-head); font-size: 34px; font-weight: 800; color: var(--accent2); line-height: 1; }
+.wt-harvest-unit { font-size: 11px; color: var(--text2); letter-spacing: 1px; margin: 4px 0; }
+.wt-harvest-sub  { font-size: 8.5px; color: var(--mute); line-height: 1.5; }
+
+/* Hint paragraph */
+.wt-hint-p {
+  font-size: 9.5px; color: var(--text2); line-height: 1.6; margin-bottom: 8px;
+}
+
+/* Map marker for placed model */
+.wt-map-marker {
+  width: 32px; height: 36px; cursor: pointer;
+  filter: drop-shadow(0 0 6px rgba(0,200,255,0.5));
+  transition: transform 0.2s;
+}
+.wt-map-marker:hover { transform: scale(1.1); }
+
+
+/* ════════════════════════════════════════════════════════
+   RESPONSIVE
+════════════════════════════════════════════════════════ */
+@media (max-width: 900px) {
+  #wt-modal { flex-direction: column; height: min(96vh, 840px); }
+  #wt-body  { flex-direction: column; }
+  #wt-viewport { flex: 1; min-height: 50%; border-right: none; border-bottom: 1px solid var(--border); }
+  #wt-panel { width: 100%; height: 48%; }
+  .brand-sub { display: none; }
+  #searchInput { width: 100px; }
+  #panel { width: 260px; }
+  :root { --panel-w: 260px; }
+}
+
+@media (max-width: 640px) {
+  .brand-sep, .brand-sub { display: none; }
+  #panel { width: 100%; position: absolute; right: 0; top: var(--topbar-h); bottom: 0; z-index: 30; }
+  #panel.collapsed { width: 0; }
+}
+
+/* ── Wind Tunnel drag-over state (added v7) ── */
+.wt-dropzone.drag-over {
+  border-color: var(--accent);
+  background: rgba(0,200,255,0.07);
+  box-shadow: 0 0 16px rgba(0,200,255,0.15);
+}
+.wt-dropzone.drag-over svg { color: var(--accent); opacity: 0.8; }
+
+/* ── wt-slider utility alias for §18 ── */
+input.wt-slider {
+  flex: 1;
+  height: 3px;
+  cursor: pointer;
+  accent-color: var(--accent);
 }
 
 
-/* ══════════════════════════════════════════════════════════════════════
-   4. SEARCH
-══════════════════════════════════════════════════════════════════════ */
-function initSearch() {
-  const input    = document.getElementById('searchInput');
-  const dropdown = document.getElementById('searchDropdown');
-  const clearBtn = document.getElementById('searchClear');
-  input.addEventListener('input', () => {
-    const q = input.value.trim();
-    clearBtn.classList.toggle('hidden', !q);
-    clearTimeout(S.searchTimer);
-    if(q.length < 2){ hideDropdown(); return; }
-    S.searchTimer = setTimeout(() => geocodeSearch(q), 350);
-  });
-  clearBtn.addEventListener('click', () => { input.value=''; clearBtn.classList.add('hidden'); hideDropdown(); input.focus(); });
-  document.addEventListener('click', e => { if(!document.getElementById('searchWrap').contains(e.target)) hideDropdown(); });
-  input.addEventListener('keydown', e => {
-    const items=dropdown.querySelectorAll('.search-item'), active=dropdown.querySelector('.search-item.active');
-    if(e.key==='Escape'){ hideDropdown(); return; }
-    if(e.key==='ArrowDown'){ e.preventDefault(); const n=active?.nextElementSibling||items[0]; if(n){ active?.classList.remove('active'); n.classList.add('active'); } }
-    if(e.key==='ArrowUp'){   e.preventDefault(); const p=active?.previousElementSibling; if(p){ active.classList.remove('active'); p.classList.add('active'); } }
-    if(e.key==='Enter'){ (active||items[0])?.click(); }
-  });
+/* ══════════════════════════════════════════════════════════════════
+   ARCHITECTURE-SCALE WIND SIM  ·  #arch-overlay
+   ──────────────────────────────────────────────────────────────────
+   Aesthetic: Obsidian + Amber (#f5a623) — architectural, technical.
+   Completely isolated from the existing #wt-overlay cyan theme.
+══════════════════════════════════════════════════════════════════ */
+
+/* ── CSS Variables (scoped under arch-modal) ── */
+#arch-modal {
+  --arch-bg:       #080b0f;
+  --arch-surface:  #0d1219;
+  --arch-surface2: #121820;
+  --arch-surface3: #1a2230;
+  --arch-border:   rgba(245,166,35,0.12);
+  --arch-border2:  rgba(245,166,35,0.28);
+  --arch-amber:    #f5a623;
+  --arch-amber2:   #ffc95c;
+  --arch-amber-dim: rgba(245,166,35,0.18);
+  --arch-white:    #e8edf5;
+  --arch-mute:     rgba(232,237,245,0.35);
+  --arch-mute2:    rgba(232,237,245,0.18);
+  --arch-green:    #3dffa0;
+  --arch-red:      #ff4f3b;
+  --arch-radius:   4px;
+  --arch-font-mono: 'DM Mono', 'Courier New', monospace;
+  --arch-font-head: 'Syne', sans-serif;
 }
 
-async function geocodeSearch(query) {
-  const dropdown = document.getElementById('searchDropdown');
-  dropdown.innerHTML = `<div class="search-loading">Buscando…</div>`;
-  dropdown.classList.remove('hidden');
-  try {
-    const res = await fetch(`${CFG.MT_GEOCODE}/${encodeURIComponent(query)}.json?key=${CFG.MT_KEY}&limit=6&language=es`);
-    if(!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const features = data.features||[];
-    if(!features.length){ dropdown.innerHTML=`<div class="search-no-results">Sin resultados</div>`; return; }
-    dropdown.innerHTML='';
-    features.forEach(f => {
-      const [lon,lat]=f.geometry.coordinates;
-      const name=f.text||f.place_name||'Lugar';
-      const sub=(f.place_name||'').replace(/^[^,]+,\s*/,'').trim();
-      const item=document.createElement('div'); item.className='search-item';
-      item.innerHTML=`<strong>${name}</strong><br><small>${sub}</small><br><code>${lat.toFixed(4)}° ${lon.toFixed(4)}°</code>`;
-      item.addEventListener('click', () => { S.map.flyTo({center:[lon,lat],zoom:14,duration:1000}); hideDropdown(); });
-      dropdown.appendChild(item);
-    });
-  } catch(e) { dropdown.innerHTML=`<div class="search-error">${e.message}</div>`; console.error('[Search]',e); }
+/* ── Overlay backdrop ── */
+#arch-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(0,0,0,0.88);
+  backdrop-filter: blur(6px) saturate(0.6);
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: 0;
+  /* Grain texture overlay for depth */
+  background-image:
+    radial-gradient(ellipse at 20% 50%, rgba(245,166,35,0.04) 0%, transparent 60%),
+    radial-gradient(ellipse at 80% 20%, rgba(0,100,200,0.04) 0%, transparent 60%),
+    url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+}
+#arch-overlay.arch-hidden { display: none; }
+
+/* ── Modal container ── */
+#arch-modal {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--arch-bg);
+  overflow: hidden;
+  /* Subtle scanline effect */
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(245,166,35,0.008) 2px,
+    rgba(245,166,35,0.008) 4px
+  );
 }
 
-function hideDropdown() { document.getElementById('searchDropdown').classList.add('hidden'); }
+/* ── Header ── */
+#arch-header {
+  flex-shrink: 0;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 18px;
+  background: var(--arch-surface);
+  border-bottom: 1px solid var(--arch-border);
+  position: relative;
+  z-index: 10;
+}
+#arch-header::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--arch-amber), transparent);
+  opacity: 0.4;
+}
 
+.arch-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--arch-amber);
+}
+.arch-brand > svg { flex-shrink: 0; }
 
-/* ════════════════════════════════════════════════════════════════════════
-   [… rest of the original script continues unchanged …]
-   [All original fog/wind analysis code from the uploaded script.js]
-   [Sections 5-17 are unchanged and would be pasted here in full …]
-════════════════════════════════════════════════════════════════════════ */
+.arch-title-group { display: flex; flex-direction: column; gap: 1px; }
+.arch-title {
+  font-family: var(--arch-font-head);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  color: var(--arch-white);
+}
+.arch-subtitle {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  letter-spacing: 1.5px;
+  color: var(--arch-amber);
+  opacity: 0.7;
+}
+.arch-scale-badge {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  letter-spacing: 1.5px;
+  color: var(--arch-amber);
+  border: 1px solid var(--arch-border2);
+  padding: 3px 7px;
+  border-radius: 2px;
+  background: var(--arch-amber-dim);
+}
 
+.arch-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.arch-status-idle, .arch-status-running, .arch-status-done, .arch-status-error {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.arch-status-idle    { background: var(--arch-mute2); }
+.arch-status-running { background: var(--arch-amber); box-shadow: 0 0 8px var(--arch-amber); animation: archPulse 1s infinite; }
+.arch-status-done    { background: var(--arch-green); }
+.arch-status-error   { background: var(--arch-red); }
+@keyframes archPulse { 0%,100%{ opacity:1; } 50%{ opacity:0.3; } }
 
-/* ════════════════════════════════════════════════════════════════════════
-   18. 3D ARCHITECTURE SIMULATION (WIND TUNNEL + FOG COLLECTOR)
-═══════════════════════════════════════════════════════════════════════ */
-(() => {
-  const AFC = 24, AFCY = 18, AFCZ = 22;
-  const A_TRAIL = 40, A_DT = 0.02, A_MAX_AGE = 400;
-  const RHO_AIR = 1.225;
-  const A_SPEED_STOPS = [
-    [0.0, new THREE.Color(0x1a3aff)],
-    [0.3, new THREE.Color(0x00c8ff)],
-    [0.5, new THREE.Color(0x00ffaa)],
-    [0.7, new THREE.Color(0xf5a623)],
-    [1.0, new THREE.Color(0xff3300)],
-  ];
+.arch-status-txt {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  letter-spacing: 2px;
+  color: var(--arch-mute);
+}
+.arch-close-btn {
+  background: none;
+  border: 1px solid var(--arch-border);
+  color: var(--arch-mute);
+  width: 28px; height: 28px;
+  border-radius: 3px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.arch-close-btn:hover { border-color: var(--arch-amber); color: var(--arch-amber); }
 
-  const AS = {
-    renderer:null, scene:null, camera:null, controls:null, rafId:null,
-    modelMesh:null, modelBBox:null, envBox:null,
-    groundPlane:null, contextMeshes:[],
-    flowGrid:null, flowDims:null,
-    particleSys:null, particles:[], trailBuf:null, colorBuf:null,
-    pressureMesh:null,
-    modelLoaded:false, simRunning:false, activeView:'streamlines', sceneScale:1,
-    particleCount:0, climate:null,
-  };
+/* ── Body: 3-column layout ── */
+#arch-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 280px 280px;
+  min-height: 0;
+  overflow: hidden;
+}
 
-  /* ── PUBLIC INTERFACE ──────────────────────────────────────────── */
-  window.btnArchSim = () => initArchSim();
+/* ── Viewport ── */
+#arch-viewport {
+  position: relative;
+  overflow: hidden;
+  background: #050709;
+  border-right: 1px solid var(--arch-border);
+}
+#arch-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
+}
 
-  function initArchSim() {
-    openArchOverlay();
-    if (!AS.renderer) {
-      setupArchRenderer();
-      setupArchScene();
-      setupArchLights();
-      setupArchGround();
-    }
-    populateArchLocationFromMap();
-    archAnimate();
+/* HUD top chips */
+#arch-hud-top {
+  position: absolute;
+  top: 14px; left: 14px;
+  display: flex; gap: 6px;
+  z-index: 5; pointer-events: none;
+}
+.arch-hud-chip {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  letter-spacing: 1.5px;
+  color: var(--arch-amber);
+  background: rgba(8,11,15,0.82);
+  border: 1px solid var(--arch-border2);
+  padding: 3px 8px;
+  border-radius: 2px;
+  backdrop-filter: blur(4px);
+}
+
+/* Controls hint */
+#arch-controls-hint {
+  position: absolute;
+  bottom: 12px; left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  letter-spacing: 1.5px;
+  color: var(--arch-mute2);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* Compass rose */
+#arch-compass-rose {
+  position: absolute;
+  bottom: 48px; left: 14px;
+  z-index: 5;
+  pointer-events: none;
+}
+
+/* Colorbar */
+#arch-colorbar {
+  position: absolute;
+  bottom: 48px; right: 14px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  pointer-events: none;
+}
+.arch-cb-label {
+  font-family: var(--arch-font-mono);
+  font-size: 7px;
+  letter-spacing: 1.5px;
+  color: var(--arch-amber);
+  opacity: 0.6;
+}
+.arch-cb-gradient {
+  width: 90px; height: 8px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #1a3aff, #00c8ff, #00ffaa, #aaff00, #f5a623, #ff3300);
+}
+.arch-cb-ticks {
+  width: 90px;
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--arch-font-mono);
+  font-size: 7px;
+  color: var(--arch-mute);
+  position: relative;
+}
+.arch-cb-unit {
+  position: absolute;
+  right: 0;
+  bottom: -12px;
+  font-size: 7px;
+  color: var(--arch-mute2);
+  letter-spacing: 1px;
+}
+
+/* View toggle */
+#arch-view-toggle {
+  position: absolute;
+  top: 14px; right: 14px;
+  display: flex;
+  gap: 1px;
+  z-index: 5;
+  background: rgba(8,11,15,0.85);
+  border: 1px solid var(--arch-border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.arch-vt-btn {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  padding: 5px 10px;
+  background: transparent;
+  color: var(--arch-mute);
+  border: none;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.arch-vt-btn:hover { color: var(--arch-amber); }
+.arch-vt-btn.active {
+  background: var(--arch-amber-dim);
+  color: var(--arch-amber);
+}
+
+/* ── Panels (left + right) ── */
+.arch-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--arch-border);
+  background: var(--arch-surface);
+}
+#arch-panel-right { border-right: none; }
+
+.arch-panel-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 0 20px 0;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(245,166,35,0.2) transparent;
+}
+.arch-panel-scroll::-webkit-scrollbar { width: 3px; }
+.arch-panel-scroll::-webkit-scrollbar-thumb { background: rgba(245,166,35,0.2); border-radius: 2px; }
+
+/* ── Section ── */
+.arch-section {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--arch-border);
+}
+.arch-section:last-child { border-bottom: none; }
+
+.arch-section-label {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  font-weight: 500;
+  letter-spacing: 2px;
+  color: var(--arch-amber);
+  opacity: 0.75;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.arch-section-label svg { flex-shrink: 0; opacity: 0.8; }
+
+/* ── Format grid ── */
+.arch-format-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+.arch-fmt {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  letter-spacing: 1px;
+  padding: 3px 7px;
+  border-radius: 2px;
+  border: 1px solid;
+}
+.arch-fmt-best {
+  color: var(--arch-amber);
+  border-color: var(--arch-amber);
+  background: rgba(245,166,35,0.08);
+}
+.arch-fmt-good {
+  color: var(--arch-green);
+  border-color: rgba(61,255,160,0.3);
+  background: rgba(61,255,160,0.05);
+}
+.arch-fmt-note {
+  color: var(--arch-mute);
+  border-color: rgba(232,237,245,0.12);
+  background: transparent;
+}
+.arch-fmt-hint {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  color: var(--arch-mute);
+  line-height: 1.6;
+  margin: 0;
+}
+
+/* ── Drop zone ── */
+.arch-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 18px 10px;
+  border: 1px dashed rgba(245,166,35,0.25);
+  border-radius: var(--arch-radius);
+  cursor: pointer;
+  transition: all 0.2s;
+  color: var(--arch-mute);
+  margin-bottom: 8px;
+}
+.arch-dropzone:hover,
+.arch-dropzone.drag-over {
+  border-color: var(--arch-amber);
+  background: var(--arch-amber-dim);
+  color: var(--arch-amber);
+}
+.arch-dz-main {
+  font-family: var(--arch-font-mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+}
+.arch-dz-sub {
+  font-family: var(--arch-font-mono);
+  font-size: 7.5px;
+  letter-spacing: 2px;
+  opacity: 0.55;
+}
+.arch-model-info {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  color: var(--arch-amber);
+  background: var(--arch-amber-dim);
+  border: 1px solid var(--arch-border2);
+  border-radius: 3px;
+  padding: 6px 8px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.arch-model-info.hidden { display: none; }
+
+/* ── Field rows ── */
+.arch-field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.arch-field-label {
+  font-family: var(--arch-font-mono);
+  font-size: 7.5px;
+  letter-spacing: 1.5px;
+  color: var(--arch-mute);
+}
+.arch-input {
+  background: var(--arch-surface2);
+  border: 1px solid rgba(245,166,35,0.15);
+  border-radius: 3px;
+  color: var(--arch-white);
+  font-family: var(--arch-font-mono);
+  font-size: 11px;
+  padding: 6px 9px;
+  outline: none;
+  transition: border-color 0.15s;
+  width: 100%;
+  box-sizing: border-box;
+}
+.arch-input:focus { border-color: var(--arch-amber); }
+.arch-input::placeholder { color: var(--arch-mute2); }
+.arch-input-full { width: 100%; }
+.arch-input-unit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.arch-input-unit .arch-input { flex: 1; }
+.arch-unit {
+  font-family: var(--arch-font-mono);
+  font-size: 8.5px;
+  letter-spacing: 1px;
+  color: var(--arch-amber);
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+
+/* ── Select ── */
+.arch-select {
+  background: var(--arch-surface2);
+  border: 1px solid rgba(245,166,35,0.15);
+  border-radius: 3px;
+  color: var(--arch-white);
+  font-family: var(--arch-font-mono);
+  font-size: 10px;
+  padding: 6px 8px;
+  width: 100%;
+  outline: none;
+  cursor: pointer;
+}
+.arch-select:focus { border-color: var(--arch-amber); }
+
+/* ── OR divider ── */
+.arch-or-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.arch-or-divider::before,
+.arch-or-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--arch-border);
+}
+.arch-or-divider span {
+  font-family: var(--arch-font-mono);
+  font-size: 7.5px;
+  color: var(--arch-mute2);
+  letter-spacing: 1px;
+  white-space: nowrap;
+}
+
+/* ── Slider rows ── */
+.arch-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.arch-sl-lbl {
+  font-family: var(--arch-font-mono);
+  font-size: 7.5px;
+  letter-spacing: 1.2px;
+  color: var(--arch-mute);
+  width: 60px;
+  flex-shrink: 0;
+}
+.arch-slider {
+  flex: 1;
+  height: 3px;
+  cursor: pointer;
+  accent-color: var(--arch-amber);
+}
+.arch-sl-val {
+  font-family: var(--arch-font-mono);
+  font-size: 9px;
+  color: var(--arch-amber);
+  width: 42px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* ── Buttons ── */
+.arch-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: var(--arch-radius);
+  font-family: var(--arch-font-mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: 1px solid;
+}
+.arch-btn-sec {
+  background: transparent;
+  border-color: rgba(245,166,35,0.2);
+  color: var(--arch-mute);
+}
+.arch-btn-sec:hover {
+  border-color: var(--arch-amber);
+  color: var(--arch-amber);
+  background: var(--arch-amber-dim);
+}
+.arch-btn-amber {
+  background: var(--arch-amber-dim);
+  border-color: var(--arch-amber);
+  color: var(--arch-amber);
+}
+.arch-btn-amber:hover {
+  background: rgba(245,166,35,0.28);
+  box-shadow: 0 0 14px rgba(245,166,35,0.2);
+}
+.arch-btn-run {
+  background: var(--arch-amber);
+  border-color: var(--arch-amber);
+  color: #0a0c0f;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+.arch-btn-run:hover {
+  background: var(--arch-amber2);
+  box-shadow: 0 0 20px rgba(245,166,35,0.35);
+}
+.arch-btn-run:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.arch-btn-run:disabled:hover { box-shadow: none; }
+
+/* ── Climate grid ── */
+.arch-climate-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-top: 8px;
+}
+.arch-climate-grid.hidden { display: none; }
+.arch-cg-item {
+  background: var(--arch-surface2);
+  border: 1px solid var(--arch-border);
+  border-radius: 3px;
+  padding: 7px 8px;
+}
+.arch-cg-k {
+  font-family: var(--arch-font-mono);
+  font-size: 7px;
+  letter-spacing: 1.5px;
+  color: var(--arch-mute2);
+  margin-bottom: 3px;
+}
+.arch-cg-v {
+  font-family: var(--arch-font-mono);
+  font-size: 13px;
+  color: var(--arch-amber);
+  font-weight: 500;
+}
+.arch-cg-u {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  color: var(--arch-mute);
+  margin-left: 2px;
+}
+
+/* ── Results ── */
+.arch-results-hidden { display: none; }
+
+.arch-harvest-hero {
+  background: linear-gradient(135deg, rgba(245,166,35,0.08), rgba(245,166,35,0.03));
+  border: 1px solid var(--arch-border2);
+  border-radius: var(--arch-radius);
+  padding: 14px;
+  text-align: center;
+  margin-bottom: 10px;
+}
+.arch-harvest-num {
+  font-family: var(--arch-font-head);
+  font-size: 38px;
+  font-weight: 800;
+  color: var(--arch-amber);
+  line-height: 1;
+  letter-spacing: -1px;
+}
+.arch-harvest-unit {
+  font-family: var(--arch-font-mono);
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--arch-mute);
+  margin-top: 4px;
+}
+.arch-harvest-monthly {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  color: var(--arch-mute2);
+  margin-top: 5px;
+}
+.arch-harvest-monthly strong { color: var(--arch-amber2); }
+
+.arch-results-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.arch-rg-item {
+  background: var(--arch-surface2);
+  border: 1px solid var(--arch-border);
+  border-radius: 3px;
+  padding: 7px 8px;
+}
+.arch-rg-k {
+  font-family: var(--arch-font-mono);
+  font-size: 7px;
+  letter-spacing: 1.5px;
+  color: var(--arch-mute2);
+  margin-bottom: 3px;
+}
+.arch-rg-v {
+  font-family: var(--arch-font-mono);
+  font-size: 12px;
+  color: var(--arch-white);
+  font-weight: 500;
+}
+.arch-rg-u {
+  font-family: var(--arch-font-mono);
+  font-size: 7.5px;
+  color: var(--arch-mute);
+  margin-left: 2px;
+}
+
+.arch-pressure-summary {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  color: var(--arch-mute);
+  line-height: 1.8;
+  border-left: 2px solid var(--arch-amber);
+  padding-left: 8px;
+  margin-bottom: 8px;
+}
+.arch-pressure-summary strong { color: var(--arch-amber2); }
+
+.arch-hint-p {
+  font-family: var(--arch-font-mono);
+  font-size: 8px;
+  color: var(--arch-mute);
+  line-height: 1.6;
+  margin: 0 0 8px 0;
+}
+
+/* ── Topbar ARCH SIM button ── */
+.btn-arch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  height: 32px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  cursor: pointer;
+  transition: all 0.18s;
+  background: rgba(245,166,35,0.06);
+  border: 1px solid rgba(245,166,35,0.25);
+  color: rgba(245,166,35,0.75);
+}
+.btn-arch svg { width: 15px; height: 15px; }
+.btn-arch:hover {
+  background: rgba(245,166,35,0.14);
+  border-color: #f5a623;
+  color: #f5a623;
+  box-shadow: 0 0 12px rgba(245,166,35,0.18);
+}
+
+/* ── Arch map marker ── */
+.arch-map-marker {
+  cursor: pointer;
+  filter: drop-shadow(0 0 6px rgba(245,166,35,0.5));
+  transition: transform 0.2s;
+}
+.arch-map-marker:hover { transform: scale(1.15); }
+
+/* ── Responsive ── */
+@media (max-width: 1100px) {
+  #arch-body { grid-template-columns: 1fr 240px 240px; }
+}
+@media (max-width: 860px) {
+  #arch-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: 55vh auto auto;
+    overflow-y: auto;
   }
-
-  function openArchOverlay() {
-    document.getElementById('arch-overlay').classList.remove('arch-hidden');
-    document.body.style.overflow = 'hidden';
-    setArchStatus('READY', 'idle');
-  }
-
-  function closeArchOverlay() {
-    document.getElementById('arch-overlay').classList.add('arch-hidden');
-    document.body.style.overflow = '';
-    stopArchSim();
-  }
-
-  function setupArchRenderer() {
-    const canvas = document.getElementById('arch-canvas');
-    AS.renderer  = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-    AS.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    AS.renderer.setClearColor(0x050709, 1);
-    AS.renderer.shadowMap.enabled = true;
-    AS.renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
-    archResizeRenderer();
-    window.addEventListener('resize', archResizeRenderer);
-  }
-
-  function archResizeRenderer() {
-    if (!AS.renderer) return;
-    const vp = document.getElementById('arch-viewport');
-    const w  = vp.clientWidth, h = vp.clientHeight;
-    AS.renderer.setSize(w, h, false);
-    if (AS.camera) {
-      AS.camera.aspect = w / h;
-      AS.camera.updateProjectionMatrix();
-    }
-  }
-
-  function setupArchScene() {
-    AS.scene  = new THREE.Scene();
-    AS.scene.fog = new THREE.FogExp2(0x050709, 0.009);
-    AS.camera = new THREE.PerspectiveCamera(40, 1, 0.1, 2000);
-    AS.camera.position.set(60, 40, 80);
-    AS.controls = new THREE.OrbitControls(AS.camera, AS.renderer.domElement);
-    AS.controls.enableDamping = true;
-    AS.controls.dampingFactor = 0.07;
-    AS.controls.minDistance   = 5;
-    AS.controls.maxDistance   = 600;
-    AS.controls.target.set(0, 10, 0);
-    AS.controls.update();
-  }
-
-  function setupArchLights() {
-    const ambient = new THREE.AmbientLight(0x2a2820, 4.5);
-    const sun  = new THREE.DirectionalLight(0xfff0c8, 4.0);
-    sun.position.set(50, 80, 40);
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(1024, 1024);
-    sun.shadow.camera.near  = 1;
-    sun.shadow.camera.far   = 300;
-    sun.shadow.camera.left  = -100;
-    sun.shadow.camera.right =  100;
-    sun.shadow.camera.top   =  100;
-    sun.shadow.camera.bottom = -100;
-    const fill = new THREE.DirectionalLight(0x6090c0, 1.8);
-    fill.position.set(-40, 20, -50);
-    const rim  = new THREE.DirectionalLight(0xf5a623, 1.8);
-    rim.position.set(0, -10, 60);
-    AS.scene.add(ambient, sun, fill, rim);
-  }
-
-  function setupArchGround() {
-    const grid = new THREE.GridHelper(200, 100, 0x1a2530, 0x101820);
-    grid.position.y = 0;
-    AS.scene.add(grid);
-    const gMat  = new THREE.MeshStandardMaterial({ color: 0x070e14, roughness: 0.95, metalness: 0 });
-    const gMesh = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), gMat);
-    gMesh.rotation.x = -Math.PI / 2;
-    gMesh.receiveShadow = true;
-    gMesh.position.y   = -0.01;
-    AS.scene.add(gMesh);
-    AS.groundPlane = gMesh;
-    const hLine = new THREE.Line(
-      new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(-200, 0, 0), new THREE.Vector3(200, 0, 0)
-      ]),
-      new THREE.LineBasicMaterial({ color: 0xf5a623, transparent: true, opacity: 0.08 })
-    );
-    AS.scene.add(hLine);
-  }
-
-  function buildContextBuildings() {
-    AS.contextMeshes.forEach(m => AS.scene.remove(m));
-    AS.contextMeshes = [];
-    const boxMat = new THREE.MeshStandardMaterial({
-      color: 0x0d1826, roughness: 0.8, metalness: 0.1,
-      transparent: true, opacity: 0.55,
-    });
-    const positions = [
-      [-50,0,30],[50,0,30],[-40,0,-50],[60,0,-40],[-70,0,-20],[80,0,10],
-      [-30,0,70],[40,0,80],[-80,0,50],[90,0,-70],[-60,0,-80],[70,0,-90],
-      [0,0,-80],[0,0,90],[-100,0,0],[100,0,-30],
-    ];
-    const sizes = [
-      [12,25,12],[18,35,14],[10,20,10],[22,45,20],[8,18,8],[16,30,16],
-      [14,22,12],[20,40,18],[12,28,10],[24,38,22],[10,15,10],[18,32,16],
-      [16,28,14],[20,50,18],[15,25,12],[22,42,20],
-    ];
-    positions.forEach(([x,y,z], i) => {
-      const [w,h,d] = sizes[i];
-      const geo  = new THREE.BoxGeometry(w, h, d);
-      const mesh = new THREE.Mesh(geo, boxMat);
-      mesh.position.set(x, h/2, z);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      AS.scene.add(mesh);
-      AS.contextMeshes.push(mesh);
-      const edges = new THREE.EdgesGeometry(geo);
-      const wire  = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
-        color: 0xf5a623, transparent: true, opacity: 0.07
-      }));
-      wire.position.copy(mesh.position);
-      AS.scene.add(wire);
-      AS.contextMeshes.push(wire);
-    });
-  }
-
-  function archAnimate() {
-    AS.rafId = requestAnimationFrame(archAnimate);
-    AS.controls && AS.controls.update();
-    if (AS.simRunning) stepArchParticles();
-    AS.renderer.render(AS.scene, AS.camera);
-  }
-
-  function stopArchSim() {
-    AS.simRunning = false;
-    if (AS.rafId) { cancelAnimationFrame(AS.rafId); AS.rafId = null; }
-  }
-
-  /* ── FIX §2,§3,§4: Robust model loading with proper error handling ── */
-  function archLoadModel(file) {
-    setArchStatus('LOADING MODEL…', 'running');
-    const ext = file.name.split('.').pop().toLowerCase();
-
-    /* FIX: Mark as not loaded initially */
-    AS.modelLoaded = false;
-
-    if (AS.modelMesh) { AS.scene.remove(AS.modelMesh); AS.modelMesh = null; }
-    if (AS.envBox)    { AS.scene.remove(AS.envBox);    AS.envBox    = null; }
-
-    const onLoaded = (object) => {
-      try {
-        const mesh = object.scene || object;
-
-        const bbox0 = new THREE.Box3().setFromObject(mesh);
-        const size0 = bbox0.getSize(new THREE.Vector3());
-        const maxD  = Math.max(size0.x, size0.y, size0.z) || 1;
-        const norm  = 30 / maxD;
-        mesh.scale.setScalar(norm);
-
-        const bLift = new THREE.Box3().setFromObject(mesh);
-        mesh.position.y -= bLift.min.y;
-
-        mesh.traverse(c => {
-          if (!c.isMesh) return;
-          c.castShadow = c.receiveShadow = true;
-          const matNew = new THREE.MeshStandardMaterial({
-            color:             0xe8d0a0,
-            roughness:         0.45,
-            metalness:         0.15,
-            emissive:          new THREE.Color(0x3a2800),
-            emissiveIntensity: 0.6,
-            transparent:       false,
-          });
-          c.material = matNew;
-          c.material.needsUpdate = true;
-        });
-
-        AS.scene.add(mesh);
-        AS.modelMesh  = mesh;
-        AS.modelBBox  = new THREE.Box3().setFromObject(mesh);
-
-        const sz  = AS.modelBBox.getSize(new THREE.Vector3());
-        const ctr = AS.modelBBox.getCenter(new THREE.Vector3());
-        const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(sz.x*1.06, sz.y*1.06, sz.z*1.06));
-        AS.envBox = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
-          color: 0xf5a623, transparent: true, opacity: 0.22
-        }));
-        AS.envBox.position.copy(ctr);
-        AS.scene.add(AS.envBox);
-
-        const cd = Math.max(sz.x, sz.y, sz.z) * 3.5;
-        AS.camera.position.set(cd, cd * 0.7, cd * 1.5);
-        AS.controls.target.copy(ctr);
-        AS.controls.update();
-
-        buildContextBuildings();
-        buildArchFlowField();
-        applyRealScale();
-
-        /* FIX: Only now mark as loaded */
-        AS.modelLoaded = true;
-        const sz2 = AS.modelBBox.getSize(new THREE.Vector3());
-        document.getElementById('archModelInfo').innerHTML =
-          `<strong>${file.name}</strong><br>${sz2.x.toFixed(1)} × ${sz2.y.toFixed(1)} × ${sz2.z.toFixed(1)} m (approx)`;
-        document.getElementById('archModelInfo').classList.remove('hidden');
-        document.getElementById('archHudModel').textContent = file.name.replace(/\.[^.]+$/, '').toUpperCase().slice(0,16);
-        updateArchHudScale();
-        showArchSection('archPlaceSection');
-        setArchStatus('MODEL READY', 'done');
-      } catch(err) {
-        console.error('[AS] Model processing error:', err);
-        AS.modelLoaded = false;
-        setArchStatus('MODEL ERROR: ' + (err.message || err), 'error');
-      }
-    };
-
-    const onError = err => {
-      console.error('[AS] Model load error:', err);
-      AS.modelLoaded = false;
-      setArchStatus('LOAD ERROR: ' + (err.message || err), 'error');
-    };
-
-    const reader = new FileReader();
-
-    if (ext === 'glb' || ext === 'gltf') {
-      reader.onload = e => {
-        try {
-          new THREE.GLTFLoader().parse(e.target.result, '', onLoaded, onError);
-        } catch(err) { onError(err); }
-      };
-      reader.onerror = () => onError(new Error('FileReader failed'));
-      reader.readAsArrayBuffer(file);
-    } else if (ext === 'obj') {
-      reader.onload = e => {
-        try {
-          const obj = new THREE.OBJLoader().parse(e.target.result);
-          obj.traverse(c => {
-            if (c.isMesh && !c.material)
-              c.material = new THREE.MeshStandardMaterial({ color: 0xe8d0a0, roughness: 0.45, metalness: 0.15, emissive: new THREE.Color(0x3a2800), emissiveIntensity: 0.6 });
-          });
-          onLoaded(obj);
-        } catch(err) { onError(err); }
-      };
-      reader.onerror = onError;
-      reader.readAsText(file);
-    } else if (ext === 'stl') {
-      reader.onload = e => {
-        try {
-          const geo = new THREE.STLLoader().parse(e.target.result);
-          geo.computeVertexNormals();
-          const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-            color: 0xe8d0a0, roughness: 0.45, metalness: 0.15, emissive: new THREE.Color(0x3a2800), emissiveIntensity: 0.6
-          }));
-          mesh.castShadow = true;
-          onLoaded(mesh);
-        } catch(err) { onError(err); }
-      };
-      reader.onerror = onError;
-      reader.readAsArrayBuffer(file);
-    } else {
-      /* FIX §4: Mark as not loaded on format error */
-      AS.modelLoaded = false;
-      setArchStatus('UNSUPPORTED FORMAT: .' + ext, 'error');
-    }
-  }
-
-  function applyRealScale() {
-    if (!AS.modelMesh || !AS.modelBBox) return;
-    const realH  = parseFloat(document.getElementById('archBldgHeight').value) || 0;
-    const realW  = parseFloat(document.getElementById('archBldgWidth').value)  || 0;
-    if (realH <= 0 && realW <= 0) {
-      updateArchHudScale();
-      buildArchFlowField();
-      return;
-    }
-
-    const sz = AS.modelBBox.getSize(new THREE.Vector3());
-    let desiredScale = AS.modelMesh.scale.x;
-
-    if (realH > 0) desiredScale *= realH / sz.y;
-    else if (realW > 0) desiredScale *= realW / Math.max(sz.x, sz.z);
-
-    AS.modelMesh.scale.setScalar(desiredScale);
-    const b = new THREE.Box3().setFromObject(AS.modelMesh);
-    AS.modelMesh.position.y -= b.min.y;
-    AS.modelBBox = new THREE.Box3().setFromObject(AS.modelMesh);
-
-    if (AS.envBox) {
-      const ctr2 = AS.modelBBox.getCenter(new THREE.Vector3());
-      const sz2  = AS.modelBBox.getSize(new THREE.Vector3());
-      AS.envBox.position.copy(ctr2);
-      AS.envBox.scale.set(sz2.x * 1.06, sz2.y * 1.06, sz2.z * 1.06);
-    }
-
-    const sz3 = AS.modelBBox.getSize(new THREE.Vector3());
-    const cd  = Math.max(sz3.x, sz3.y, sz3.z) * 3;
-    AS.camera.position.set(cd, cd * 0.6, cd * 1.4);
-    AS.controls.target.copy(AS.modelBBox.getCenter(new THREE.Vector3()));
-    AS.controls.update();
-
-    updateArchHudScale();
-    buildArchFlowField();
-    setArchStatus('SCALE APPLIED', 'done');
-  }
-
-  function updateArchTransforms() {
-    if (!AS.modelMesh) return;
-    const scale = parseFloat(document.getElementById('archScale').value)     || 1;
-    const rotY  = parseFloat(document.getElementById('archRotY').value)      || 0;
-    const elevOff = parseFloat(document.getElementById('archElevOff').value) || 0;
-
-    AS.modelMesh.scale.setScalar(scale);
-    AS.modelMesh.rotation.y = (rotY * Math.PI) / 180;
-
-    const b = new THREE.Box3().setFromObject(AS.modelMesh);
-    AS.modelMesh.position.y = -b.min.y + elevOff;
-
-    AS.modelBBox = new THREE.Box3().setFromObject(AS.modelMesh);
-    if (AS.envBox) {
-      const ctr = AS.modelBBox.getCenter(new THREE.Vector3());
-      const sz  = AS.modelBBox.getSize(new THREE.Vector3());
-      AS.envBox.position.copy(ctr);
-      AS.envBox.scale.set(sz.x * 1.06, sz.y * 1.06, sz.z * 1.06);
-    }
-    buildArchFlowField();
-  }
-
-  /* FIX §1: COORDINATE SPACE ALIGNMENT
-     The flow domain is now centered at origin (0,0,0) with the model
-     positioned naturally around it. Inlet is upwind of model center.
-  */
-  function buildArchFlowField() {
-    if (!AS.modelMesh || !AS.modelBBox) return;
-
-    try {
-      const bbox = AS.modelBBox;
-      const centre = bbox.getCenter(new THREE.Vector3());
-      const size   = bbox.getSize(new THREE.Vector3());
-
-      /* Domain dimensions scale with model size */
-      const domW = size.x * 8;
-      const domH = size.y * 5;
-      const domD = size.z * 8;
-
-      /* Inlet is 2.8× upstream from model center (realistic CFD inlet proportion) */
-      const ox   = centre.x - size.x * 2.8;
-      const oy   = 0;
-      const oz   = centre.z - domD / 2;
-
-      const cellW = domW / (AFC  - 1);
-      const cellH = domH / (AFCY - 1);
-      const cellD = domD / (AFCZ - 1);
-
-      /* Store flow field dimensions for particle sampling */
-      AS.flowDims = { cx:AFC, cy:AFCY, cz:AFCZ, ox, oy, oz, cellW, cellH, cellD };
-
-      const ax = size.x * 0.65, ay = size.y * 0.65, az = size.z * 0.65;
-      const cx = centre.x, cy = centre.y, cz = centre.z;
-      const U  = 1.0, A = U * ax * ay * az;
-
-      const grid = new Float32Array(AFC * AFCY * AFCZ * 3);
-
-      /* Dipole flow field computation */
-      for (let iz = 0; iz < AFCZ; iz++) {
-        for (let iy = 0; iy < AFCY; iy++) {
-          for (let ix = 0; ix < AFC; ix++) {
-            const wx = ox + ix * cellW;
-            const wy = oy + iy * cellH;
-            const wz = oz + iz * cellD;
-
-            function dipole(dx, dy, dz) {
-              const r2 = dx*dx + dy*dy + dz*dz;
-              const r  = Math.sqrt(r2) || 1e-9;
-              const r5 = r2 * r2 * r;
-              return {
-                u:  U * (1 - A*(2*dx*dx - dy*dy - dz*dz) / r5),
-                v: -U *      A * 3 * dx * dy / r5,
-                w: -U *      A * 3 * dx * dz / r5,
-              };
-            }
-
-            const dxR = (wx - cx) / (ax * 1.12);
-            const dyR = (wy - cy) / (ay * 1.12);
-            const dzR = (wz - cz) / (az * 1.12);
-            const rR  = Math.sqrt(dxR*dxR + dyR*dyR + dzR*dzR);
-
-            const dxI = (wx - cx)  / (ax * 1.12);
-            const dyI = (wy + cy)  / (ay * 1.12);
-            const dzI = (wz - cz)  / (az * 1.12);
-
-            let u, v, w;
-            if (rR < 1.0) {
-              u = 0; v = 0; w = 0;
-            } else {
-              const d1 = dipole(dxR, dyR, dzR);
-              const d2 = dipole(dxI, dyI, dzI);
-              u = (d1.u + d2.u) * 0.5;
-              v = (d1.v - d2.v) * 0.5;
-              w = (d1.w + d2.w) * 0.5;
-              u = Math.max(-3, Math.min(3, u));
-              v = Math.max(-3, Math.min(3, v));
-              w = Math.max(-3, Math.min(3, w));
-            }
-
-            const groundDamp = Math.min(1, wy / Math.max(0.5, ay * 0.3));
-            v *= groundDamp;
-
-            const idx = (iz * AFCY * AFC + iy * AFC + ix) * 3;
-            grid[idx]   = u;
-            grid[idx+1] = v;
-            grid[idx+2] = w;
-          }
-        }
-      }
-      AS.flowGrid = grid;
-
-      if (AS.activeView === 'pressure') buildPressureMesh();
-    } catch(err) {
-      console.error('[AS] Flow field build error:', err);
-      setArchStatus('FLOW FIELD BUILD ERROR', 'error');
-      AS.flowGrid = null;
-    }
-  }
-
-  function sampleArchFlow(wx, wy, wz) {
-    const d = AS.flowDims;
-    if (!d || !AS.flowGrid) return { u:1, v:0, w:0 };
-
-    const fx = (wx - d.ox) / d.cellW;
-    const fy = (wy - d.oy) / d.cellH;
-    const fz = (wz - d.oz) / d.cellD;
-
-    const ix0 = Math.max(0, Math.min(AFC-2,  Math.floor(fx)));
-    const iy0 = Math.max(0, Math.min(AFCY-2, Math.floor(fy)));
-    const iz0 = Math.max(0, Math.min(AFCZ-2, Math.floor(fz)));
-    const tx  = fx-ix0, ty = fy-iy0, tz = fz-iz0;
-
-    const g = (ix,iy,iz,c) => AS.flowGrid[((iz*AFCY+iy)*AFC+ix)*3+c];
-    const lerpC = c => {
-      const v000=g(ix0,iy0,iz0,c),   v100=g(ix0+1,iy0,iz0,c);
-      const v010=g(ix0,iy0+1,iz0,c), v110=g(ix0+1,iy0+1,iz0,c);
-      const v001=g(ix0,iy0,iz0+1,c), v101=g(ix0+1,iy0,iz0+1,c);
-      const v011=g(ix0,iy0+1,iz0+1,c), v111=g(ix0+1,iy0+1,iz0+1,c);
-      const e00=v000+(v100-v000)*tx, e10=v010+(v110-v010)*tx;
-      const e01=v001+(v101-v001)*tx, e11=v011+(v111-v011)*tx;
-      return (e00+(e10-e00)*ty)*(1-tz) + (e01+(e11-e01)*ty)*tz;
-    };
-    return { u:lerpC(0), v:lerpC(1), w:lerpC(2) };
-  }
-
-  /* FIX §5: Proper pressure mesh cleanup and rebuild */
-  function buildPressureMesh() {
-    if (AS.pressureMesh) {
-      if (AS.pressureMesh.geometry) AS.pressureMesh.geometry.dispose();
-      if (AS.pressureMesh.material) AS.pressureMesh.material.dispose();
-      AS.scene.remove(AS.pressureMesh);
-      AS.pressureMesh = null;
-    }
-
-    const d = AS.flowDims;
-    if (!d) return;
-
-    const RES = 60;
-    const xs  = d.ox, xe = d.ox + d.cellW * (AFC-1);
-    const zs  = d.oz, ze = d.oz + d.cellD * (AFCZ-1);
-    const dx  = (xe - xs) / (RES - 1);
-    const dz  = (ze - zs) / (RES - 1);
-
-    const Y_SAMPLE = 1.0;
-    let pMin = Infinity, pMax = -Infinity;
-    const pArr = new Float32Array(RES * RES);
-    for (let iz = 0; iz < RES; iz++) {
-      for (let ix = 0; ix < RES; ix++) {
-        const wx = xs + ix * dx;
-        const wz = zs + iz * dz;
-        const { u, v, w } = sampleArchFlow(wx, Y_SAMPLE, wz);
-        const spd2 = u*u + v*v + w*w;
-        const p    = 0.5 * RHO_AIR * (1.0 - spd2);
-        pArr[iz * RES + ix] = p;
-        if (p < pMin) pMin = p;
-        if (p > pMax) pMax = p;
-      }
-    }
-
-    const geo = new THREE.PlaneGeometry(xe-xs, ze-zs, RES-1, RES-1);
-    geo.rotateX(-Math.PI / 2);
-    const colours = new Float32Array(RES * RES * 3);
-    const pRange  = pMax - pMin || 1;
-    for (let i = 0; i < RES * RES; i++) {
-      const t   = (pArr[i] - pMin) / pRange;
-      const col = pressureColor(t);
-      colours[i*3]   = col.r;
-      colours[i*3+1] = col.g;
-      colours[i*3+2] = col.b;
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colours, 3));
-
-    const mat = new THREE.MeshBasicMaterial({
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.55,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
-    AS.pressureMesh = new THREE.Mesh(geo, mat);
-    AS.pressureMesh.position.set((xs+xe)*0.5, 0.05, (zs+ze)*0.5);
-    AS.scene.add(AS.pressureMesh);
-
-    const windSpd = AS.climate ? AS.climate.speed : 5;
-    document.getElementById('archCbMid').textContent = (windSpd * 0.5).toFixed(1);
-    document.getElementById('archCbMax').textContent = (windSpd * 1.4).toFixed(1);
-  }
-
-  function pressureColor(t) {
-    const stops = [
-      [0,   new THREE.Color(0x1a3aff)],
-      [0.4, new THREE.Color(0x00c8ff)],
-      [0.6, new THREE.Color(0x00ffaa)],
-      [0.8, new THREE.Color(0xf5a623)],
-      [1.0, new THREE.Color(0xff3300)],
-    ];
-    t = Math.max(0, Math.min(1, t));
-    for (let i = 1; i < stops.length; i++) {
-      const [t0,c0] = stops[i-1], [t1,c1] = stops[i];
-      if (t <= t1) return new THREE.Color().lerpColors(c0, c1, (t-t0)/(t1-t0));
-    }
-    return stops[stops.length-1][1];
-  }
-
-  function setViewMode(mode) {
-    AS.activeView = mode;
-    document.querySelectorAll('.arch-vt-btn').forEach(b => {
-      b.classList.toggle('active', b.dataset.view === mode);
-    });
-    if (mode === 'pressure') {
-      if (AS.particleSys) AS.particleSys.visible = false;
-      buildPressureMesh();
-      if (AS.pressureMesh) AS.pressureMesh.visible = true;
-    } else {
-      if (AS.pressureMesh) AS.pressureMesh.visible = false;
-      if (AS.particleSys)  AS.particleSys.visible = true;
-    }
-  }
-
-  /* FIX §3,§6: Proper particle system cleanup */
-  function initArchParticles() {
-    if (AS.particleSys) {
-      if (AS.particleSys.geometry) AS.particleSys.geometry.dispose();
-      if (AS.particleSys.material) AS.particleSys.material.dispose();
-      AS.scene.remove(AS.particleSys);
-      AS.particleSys = null;
-    }
-    AS.particleCount = parseInt(document.getElementById('archParticles').value) || 3000;
-    const N    = AS.particleCount;
-    const segs = A_TRAIL;
-
-    const positions = new Float32Array(N * segs * 2 * 3);
-    const colors    = new Float32Array(N * segs * 2 * 3);
-    const geo  = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3));
-
-    const mat = new THREE.LineBasicMaterial({
-      vertexColors: true, transparent: true, opacity: 0.68,
-      depthWrite: false, blending: THREE.AdditiveBlending,
-    });
-    AS.particleSys = new THREE.LineSegments(geo, mat);
-    AS.particleSys.visible = (AS.activeView === 'streamlines');
-    AS.scene.add(AS.particleSys);
-
-    AS.particles = Array.from({ length: N }, () => spawnArchParticle());
-    AS.trailBuf  = positions;
-    AS.colorBuf  = colors;
-  }
-
-  function spawnArchParticle() {
-    const d = AS.flowDims;
-    if (!d) return { x:0, y:5, z:0, age:0, trail:[], speeds:[] };
-    const x = d.ox + Math.random() * d.cellW * 1.5;
-    const y = d.oy + 0.5 + Math.random() * (AFCY-1) * d.cellH * 0.9;
-    const z = d.oz + Math.random() * (AFCZ-1) * d.cellD;
-    return { x, y, z, age: Math.floor(Math.random() * A_MAX_AGE), trail:[], speeds:[] };
-  }
-
-  function resetArchParticle(p) {
-    const d = AS.flowDims;
-    if (!d) return;
-    p.x = d.ox + Math.random() * d.cellW * 1.5;
-    p.y = d.oy + 0.5 + Math.random() * (AFCY-1) * d.cellH * 0.9;
-    p.z = d.oz + Math.random() * (AFCZ-1) * d.cellD;
-    p.age = 0; p.trail = []; p.speeds = [];
-  }
-
-  function stepArchParticles() {
-    if (!AS.particles || !AS.flowDims) return;
-    const d = AS.flowDims;
-    const N = AS.particleCount, segs = A_TRAIL;
-
-    const overrideSl = parseFloat(document.getElementById('archWindOverride').value) || 0;
-    const windSpd = overrideSl > 0.4 ? overrideSl
-                  : (AS.climate ? AS.climate.speed : 5);
-    const speedScale = Math.max(0.5, windSpd) * 0.4;
-
-    const domXMax = d.ox + d.cellW  * (AFC-1);
-    const domYMax = d.oy + d.cellH  * (AFCY-1);
-    const domZMax = d.oz + d.cellD  * (AFCZ-1);
-
-    let maxSpd = 0;
-
-    for (let i = 0; i < N; i++) {
-      const p = AS.particles[i];
-      p.age++;
-      const { u, v, w } = sampleArchFlow(p.x, p.y, p.z);
-      const spd = Math.hypot(u, v, w);
-      if (spd > maxSpd) maxSpd = spd;
-
-      p.x += u * A_DT * speedScale;
-      p.y += v * A_DT * speedScale;
-      p.z += w * A_DT * speedScale;
-      if (p.y < 0.1) p.y = 0.1;
-
-      p.trail.push(p.x, p.y, p.z);
-      p.speeds.push(spd);
-      if (p.trail.length > segs * 3) { p.trail.splice(0, 3); p.speeds.splice(0, 1); }
-
-      if (p.x < d.ox || p.x > domXMax || p.y > domYMax ||
-          p.z < d.oz || p.z > domZMax || p.age > A_MAX_AGE || spd < 0.001) {
-        resetArchParticle(p);
-      }
-    }
-
-    const pos = AS.trailBuf, col = AS.colorBuf;
-    const nf  = maxSpd > 0 ? 1 / maxSpd : 1;
-    for (let i = 0; i < N; i++) {
-      const p  = AS.particles[i];
-      const base = i * segs * 2 * 3;
-      const t  = p.trail, ns = Math.floor(t.length / 3);
-      for (let s = 0; s < segs; s++) {
-        const v0 = Math.min(s,     Math.max(0, ns-2));
-        const v1 = Math.min(s+1,   Math.max(0, ns-1));
-        const off = base + s * 6;
-        pos[off]   = t[v0*3]   || 0; pos[off+1] = t[v0*3+1] || 0; pos[off+2] = t[v0*3+2] || 0;
-        pos[off+3] = t[v1*3]   || 0; pos[off+4] = t[v1*3+1] || 0; pos[off+5] = t[v1*3+2] || 0;
-        const spd  = (p.speeds[v0] || 0) * nf;
-        const c    = archSpeedColor(spd);
-        col[off] = col[off+3] = c.r;
-        col[off+1] = col[off+4] = c.g;
-        col[off+2] = col[off+5] = c.b;
-      }
-    }
-    const attr = AS.particleSys.geometry.attributes;
-    attr.position.needsUpdate = true;
-    attr.color.needsUpdate    = true;
-  }
-
-  function archSpeedColor(t) {
-    t = Math.max(0, Math.min(1, t));
-    for (let i = 1; i < A_SPEED_STOPS.length; i++) {
-      const [t0,c0] = A_SPEED_STOPS[i-1], [t1,c1] = A_SPEED_STOPS[i];
-      if (t <= t1) return new THREE.Color().lerpColors(c0, c1, (t-t0)/(t1-t0));
-    }
-    return A_SPEED_STOPS[A_SPEED_STOPS.length-1][1];
-  }
-
-  async function fetchArchClimate() {
-    const btn = document.getElementById('archFetchClimate');
-    btn.disabled = true;
-    setArchStatus('FETCHING CLIMATE…', 'running');
-
-    const lat   = parseFloat(document.getElementById('archLat').value)  || S.selectedPoint?.lat  || CFG.CENTER[1];
-    const lon   = parseFloat(document.getElementById('archLon').value)  || S.selectedPoint?.lon  || CFG.CENTER[0];
-    const month = document.getElementById('archMonth').value;
-
-    try {
-      const d = await fetchPointData(lat, lon, '10m', month);
-      AS.climate = { speed: d.speed, dir: d.dir, humidity: d.humidity, temp: d.temp, month };
-
-      const arrowDeg = (d.dir + 180) % 360;
-      document.getElementById('archWindArrowG').setAttribute('transform', `rotate(${arrowDeg},40,40)`);
-      document.getElementById('archWindSpeedLabel').textContent = d.speed.toFixed(1) + ' m/s';
-
-      document.getElementById('archHudLoc').textContent =
-        `${lat.toFixed(3)}°, ${lon.toFixed(3)}°`;
-
-      const grid = document.getElementById('archClimateGrid');
-      grid.innerHTML = [
-        { k:'WIND SPEED', v: d.speed.toFixed(1), u:'m/s' },
-        { k:'DIRECTION',  v: toDirCard(d.dir),   u:`${Math.round(d.dir)}°` },
-        { k:'HUMIDITY',   v: Math.round(d.humidity), u:'%' },
-        { k:'TEMPERATURE', v: d.temp.toFixed(1), u:'°C' },
-        { k:'MODEL',       v: S.activeModel,     u:'' },
-        { k:'UTC HOUR',    v: S.activeHour ? S.activeHour.slice(11,16) : '—', u:'' },
-      ].map(r => `<div class="arch-cg-item"><div class="arch-cg-k">${r.k}</div><div class="arch-cg-v">${r.v}<span class="arch-cg-u">${r.u ? ' '+r.u : ''}</span></div></div>`).join('');
-      grid.classList.remove('hidden');
-
-      buildArchFlowField();
-      setArchStatus(`ICON · ${toDirCard(d.dir)} ${d.speed.toFixed(1)} m/s`, 'done');
-    } catch(err) {
-      setArchStatus('CLIMATE FETCH ERROR', 'error');
-      console.error('[AS] Climate:', err);
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  /* FIX §2,§7: Add race condition protection and error checking */
-  function runArchSim() {
-    if (!AS.modelLoaded) {
-      setArchStatus('UPLOAD A MODEL FIRST', 'error');
-      return;
-    }
-
-    setArchStatus('BUILDING FLOW FIELD…', 'running');
-    
-    /* FIX: Delay to ensure model transforms are fully processed */
-    setTimeout(() => {
-      try {
-        buildArchFlowField();
-        
-        /* FIX §7: Verify flow field was created successfully */
-        if (!AS.flowGrid || !AS.flowDims) {
-          setArchStatus('FLOW FIELD BUILD FAILED', 'error');
-          return;
-        }
-
-        initArchParticles();
-        AS.simRunning = true;
-        if (!AS.rafId) archAnimate();
-
-        if (AS.activeView === 'pressure') buildPressureMesh();
-
-        setTimeout(() => {
-          if (AS.flowGrid && AS.particleCount > 0) {
-            const r = computeArchResults();
-            displayArchResults(r);
-            setArchStatus(`SIM ACTIVE · ${AS.particleCount} PARTICLES`, 'running');
-          } else {
-            setArchStatus('SIM INITIALIZATION FAILED', 'error');
-          }
-        }, 2500);
-      } catch(err) {
-        console.error('[AS] Simulation error:', err);
-        setArchStatus('SIM ERROR: ' + (err.message || err), 'error');
-        AS.simRunning = false;
-      }
-    }, 200);
-  }
-
-  /* FIX §6: Proper reset of all simulation state */
-  function resetArchSim() {
-    stopArchSim();
-    if (AS.particleSys) {
-      if (AS.particleSys.geometry) AS.particleSys.geometry.dispose();
-      if (AS.particleSys.material) AS.particleSys.material.dispose();
-      AS.scene.remove(AS.particleSys);
-      AS.particleSys = null;
-    }
-    if (AS.pressureMesh) {
-      if (AS.pressureMesh.geometry) AS.pressureMesh.geometry.dispose();
-      if (AS.pressureMesh.material) AS.pressureMesh.material.dispose();
-      AS.scene.remove(AS.pressureMesh);
-      AS.pressureMesh = null;
-    }
-    AS.particles = [];
-    AS.flowGrid = null;
-    document.getElementById('archResultsSection').classList.add('arch-results-hidden');
-    setArchStatus('RESET', 'idle');
-    archAnimate();
-  }
-
-  function computeArchResults() {
-    const climate  = AS.climate || { speed:5, dir:270, humidity:82, temp:15 };
-    const windSpeed = climate.speed;
-    const humidity  = climate.humidity;
-
-    const manualA = parseFloat(document.getElementById('archAreaInput').value) || 0;
-    let area;
-    if (manualA > 0) {
-      area = manualA;
-    } else if (AS.modelBBox) {
-      const sz = AS.modelBBox.getSize(new THREE.Vector3());
-      area = sz.y * sz.z;
-    } else { area = 50; }
-
-    const lwc  = estimateLWC(humidity);
-    const vEff = Math.max(0.5, windSpeed * 0.88);
-    const eta  = 0.20;
-    const daily = lwc * vEff * eta * area * 86400 / 1000;
-
-    let stagRatio = 1.0, suctionZone = 0;
-    if (AS.modelBBox && AS.flowDims) {
-      const ctr = AS.modelBBox.getCenter(new THREE.Vector3());
-      const sz  = AS.modelBBox.getSize(new THREE.Vector3());
-      let sampleCount = 0, highPressCount = 0;
-      for (let t = 0; t < 20; t++) {
-        const wr = (Math.random() - 0.5) * sz.z * 0.9;
-        const wh = Math.random() * sz.y;
-        const { u:uf } = sampleArchFlow(ctr.x - sz.x * 0.52, ctr.y + wh, ctr.z + wr);
-        const { u:uw } = sampleArchFlow(ctr.x + sz.x * 0.52, ctr.y + wh, ctr.z + wr);
-        sampleCount++;
-        if (Math.abs(uf) < 0.3) highPressCount++;
-        if (uw < 0.2) suctionZone++;
-      }
-      stagRatio  = (highPressCount / sampleCount).toFixed(2);
-      suctionZone = Math.round(suctionZone / sampleCount * 100);
-    }
-
-    return {
-      area:        area.toFixed(1),
-      lwc:         lwc.toFixed(3),
-      vEff:        vEff.toFixed(2),
-      daily:       Math.max(0, daily).toFixed(2),
-      monthly:     (Math.max(0, daily) * 30).toFixed(1),
-      annual:      (Math.max(0, daily) * 365).toFixed(0),
-      stagRatio,
-      suctionZone,
-      windSpeed:   windSpeed.toFixed(1),
-      humidity:    Math.round(humidity),
-    };
-  }
-
-  function displayArchResults(r) {
-    document.getElementById('archResultsSection').classList.remove('arch-results-hidden');
-    document.getElementById('archDailyYield').textContent  = r.daily;
-    document.getElementById('archMonthlyYield').textContent = r.monthly;
-    document.getElementById('archAnnualYield').textContent  = r.annual;
-    document.getElementById('archAreaVal').textContent      = r.area;
-
-    document.getElementById('archPressureSummary').innerHTML =
-      `Wind from <strong>${toDirCard(AS.climate?.dir || 270)}</strong> at <strong>${r.windSpeed} m/s</strong> · ` +
-      `Stagnation ratio ${r.stagRatio} · Suction zone ${r.suctionZone}% of downwind face<br>` +
-      `Humidity ${r.humidity}% · LWC ${r.lwc} g/m³ · η = 20%<br>` +
-      `Estimated annual collection: <strong>${r.annual} L/m²</strong>`;
-
-    showArchSection('archResultsSection');
-  }
-
-  function archPlaceOnMap() {
-    const lat = parseFloat(document.getElementById('archLat').value) || S.selectedPoint?.lat;
-    const lon = parseFloat(document.getElementById('archLon').value) || S.selectedPoint?.lon;
-    if (!lat || !lon) { alert('Enter latitude and longitude first.'); return; }
-
-    const el  = document.createElement('div');
-    el.className = 'arch-map-marker';
-    el.title  = document.getElementById('archProjName').value || 'Arch Sim Model';
-    el.innerHTML = `
-      <svg viewBox="0 0 32 32" fill="none" width="32">
-        <rect x="10" y="6" width="12" height="18" rx="1.5" stroke="#f5a623" stroke-width="1.5"/>
-        <rect x="2" y="14" width="8" height="10" rx="1" stroke="#f5a623" stroke-width="1.1" opacity="0.7"/>
-        <rect x="22" y="10" width="8" height="14" rx="1" stroke="#f5a623" stroke-width="1.1" opacity="0.7"/>
-        <line x1="0" y1="24" x2="32" y2="24" stroke="#f5a623" stroke-width="1.2"/>
-        <circle cx="16" cy="28" r="2.5" fill="#f5a623" opacity="0.85"/>
-      </svg>`;
-
-    new maptilersdk.Marker({ element: el, anchor: 'bottom' })
-      .setLngLat([lon, lat])
-      .addTo(S.map);
-
-    S.map.flyTo({
-      center: [lon, lat], zoom: 16,
-      pitch: CFG.PITCH, bearing: CFG.BEARING, duration: 1800,
-    });
-    closeArchOverlay();
-  }
-
-  function exportArchDataCard() {
-    const lat  = document.getElementById('archLat').value   || '—';
-    const lon  = document.getElementById('archLon').value   || '—';
-    const elev = document.getElementById('archElev').value  || '—';
-    const name = document.getElementById('archProjName').value || 'Untitled';
-    const c    = AS.climate || {};
-    const r    = AS.modelBBox ? (() => computeArchResults())() : null;
-
-    const card = {
-      project:    name,
-      location:   { lat, lon, elevation_m: elev },
-      model:      { S_activeModel: S.activeModel, hour_utc: S.activeHour || '—' },
-      climate: {
-        wind_speed_ms:  c.speed?.toFixed(2) || '—',
-        wind_dir_deg:   c.dir   || '—',
-        humidity_pct:   c.humidity || '—',
-        temperature_c:  c.temp?.toFixed(1) || '—',
-        month:          c.month || '—',
-      },
-      harvest:    r ? {
-        daily_L_m2:     r.daily,
-        monthly_L_m2:   r.monthly,
-        annual_L_m2:    r.annual,
-        collection_m2:  r.area,
-        lwc_g_m3:       r.lwc,
-        efficiency:     '20%',
-      } : 'Run simulation first',
-      generated:  new Date().toISOString(),
-    };
-
-    const blob = new Blob([JSON.stringify(card, null, 2)], { type: 'application/json' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = `${name.replace(/\s+/g,'-')}-arch-wind-data.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  function setArchStatus(msg, type) {
-    const dot = document.getElementById('archStatusDot');
-    const txt = document.getElementById('archStatusTxt');
-    dot.className = `arch-status-${type}`;
-    txt.textContent = msg;
-  }
-
-  function showArchSection(id) {
-    document.getElementById(id).classList.remove('arch-results-hidden');
-  }
-
-  function populateArchLocationFromMap() {
-    if (!S.selectedPoint) return;
-    document.getElementById('archLat').value  = S.selectedPoint.lat.toFixed(5);
-    document.getElementById('archLon').value  = S.selectedPoint.lon.toFixed(5);
-    document.getElementById('archElev').value = S.selectedPoint.elevation || '';
-    document.getElementById('archHudLoc').textContent =
-      `${S.selectedPoint.lat.toFixed(3)}°, ${S.selectedPoint.lon.toFixed(3)}°`;
-  }
-
-  function updateArchHudScale() {
-    const rH = document.getElementById('archBldgHeight').value;
-    const rW = document.getElementById('archBldgWidth').value;
-    if (rH) document.getElementById('archHudScale').textContent = `H = ${rH} m`;
-    else if (rW) document.getElementById('archHudScale').textContent = `W = ${rW} m`;
-    else document.getElementById('archHudScale').textContent = 'SCALE 1:1';
-  }
-
-  function setupArchDragDrop() {
-    const zone  = document.getElementById('archUploadArea');
-    const input = document.getElementById('archFileInput');
-
-    zone.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      input.value = '';
-      input.click();
-    });
-
-    zone.addEventListener('dragover',  e => { e.preventDefault(); e.stopPropagation(); zone.classList.add('drag-over'); });
-    zone.addEventListener('dragleave', (e) => { e.stopPropagation(); zone.classList.remove('drag-over'); });
-    zone.addEventListener('drop', e => {
-      e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag-over');
-      const file = e.dataTransfer.files[0];
-      if (file) archLoadModel(file);
-    });
-  }
-
-  function wireArchEvents() {
-    document.getElementById('btnArchSim').addEventListener('click', initArchSim);
-    document.getElementById('arch-close').addEventListener('click', closeArchOverlay);
-    document.getElementById('arch-overlay').addEventListener('click', e => {
-      if (e.target === document.getElementById('arch-overlay')) closeArchOverlay();
-    });
-    document.addEventListener('keydown', e => {
-      if (e.key === 'Escape' &&
-          !document.getElementById('arch-overlay').classList.contains('arch-hidden')) {
-        closeArchOverlay();
-      }
-    });
-
-    document.getElementById('archFileInput').addEventListener('change', e => {
-      const f = e.target.files[0]; if (f) archLoadModel(f);
-    });
-    setupArchDragDrop();
-
-    document.getElementById('archApplyScale').addEventListener('click', applyRealScale);
-
-    [
-      ['archScale',    'archScaleVal',    v => v.toFixed(1) + '×'],
-      ['archRotY',     'archRotYVal',     v => Math.round(v) + '°'],
-      ['archElevOff',  'archElevOffVal',  v => v.toFixed(1) + ' m'],
-    ].forEach(([id, valId, fmt]) => {
-      document.getElementById(id).addEventListener('input', function() {
-        document.getElementById(valId).textContent = fmt(parseFloat(this.value));
-        updateArchTransforms();
-      });
-    });
-
-    document.getElementById('archParticles').addEventListener('input', function() {
-      document.getElementById('archParticlesVal').textContent = this.value;
-    });
-    document.getElementById('archWindOverride').addEventListener('input', function() {
-      const v = parseFloat(this.value);
-      document.getElementById('archWindOverrideVal').textContent =
-        v > 0.4 ? v.toFixed(1) + ' m/s' : 'AUTO';
-    });
-
-    document.getElementById('archUseMapPoint').addEventListener('click', () => {
-      populateArchLocationFromMap();
-      if (!S.selectedPoint) alert('Click on the main map first to select a point.');
-    });
-
-    document.getElementById('archFetchClimate').addEventListener('click', fetchArchClimate);
-
-    document.querySelectorAll('.arch-vt-btn').forEach(btn => {
-      btn.addEventListener('click', () => setViewMode(btn.dataset.view));
-    });
-
-    document.getElementById('archRunSim').addEventListener('click', runArchSim);
-    document.getElementById('archResetSim').addEventListener('click', resetArchSim);
-
-    document.getElementById('archPlaceOnMap').addEventListener('click', archPlaceOnMap);
-    document.getElementById('archExportData').addEventListener('click', exportArchDataCard);
-  }
-
-  wireArchEvents();
-
-})();
-/* ═══════════════════════════════════════════════════════════════════════
-   END OF v8 — Architecture Simulation Module
-   All coordinate space, memory, and race condition bugs fixed.
-═══════════════════════════════════════════════════════════════════════ */
+  #arch-viewport { height: 55vh; border-right: none; border-bottom: 1px solid var(--arch-border); }
+  .arch-panel { border-right: none; border-bottom: 1px solid var(--arch-border); max-height: 60vh; }
+}
