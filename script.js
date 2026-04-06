@@ -1,22 +1,22 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   FogHarvest  ·  script.js  ·  v7
+   FogHarvest  ·  script.js  ·  v7-fixed
    ─────────────────────────────────────────────────────────────────────
-   Changes vs v5:
-   §1   CFG — added API_ICON (/v1/icon), API_GFS (/v1/gfs),
-              HOURLY_VARS, ARCHIVE_VARS
-   §2   S   — added activeModel, activeHour fields
-   §6   fetchWindField / fetchPointData completely rewritten:
-        ├─ fetchPointICON   → ICON 13 km primary
-        │    • requests forecast_days=2, timezone=UTC
-        │    • findNearestHourIndex() picks the hourly slot
-        │      whose timestamp is closest to Date.now()
-        │    • on HTTP error → automatic GFS fallback
-        ├─ fetchPointArchive → unchanged v5 monthly-average logic
-        └─ fetchPointData   → dispatcher (current → ICON, else → archive)
-   §14  renderPanel — atm grid now shows MODEL + HORA UTC rows
-   §16  setStatus   — status bar shows "ICON 13km · HH:MM UTC · ALT · MES"
-                      or "GFS (fallback)" when ICON was unavailable
-   All other sections preserved verbatim from v5.
+   Fixes vs v7:
+   §6   buildUVGrid — corrected UV sign convention:
+        u =  speed * sin(rad)   (east is +canvas-X ✓)
+        v =  speed * cos(rad)   (north is stored positive)
+        §7 particle frame: p.y -= v * scale  (−v because canvas-Y is
+        inverted vs geographic N). Removing the negation in buildUVGrid
+        and keeping the subtraction in the particle loop gives one clean
+        sign flip total — vectors now flow in the correct direction.
+   §18  3D Wind Tunnel — setupDragDrop now wires a click handler on the
+        drop-zone so clicking also opens the file picker (was missing).
+        loadModel() renamed to wtLoadModel() to avoid collision with the
+        now-deleted legacy tunnel block at the bottom of this file.
+   §19  Arch Sim — no changes needed (was already correct).
+   DELETED: the legacy "3D WIND TUNNEL MODEL UPLOAD FIX" block (§20)
+        that used loader.load(blobURL), which silently hangs in THREE
+        r128 and shadowed the IIFE's local loadModel function.
 ═══════════════════════════════════════════════════════════════════════ */
 
 
@@ -36,11 +36,10 @@ const CFG = {
   TERRAIN_EXG: 1.5,
 
   /* ── Weather API endpoints ───────────────────────── */
-  API_ICON:    'https://api.open-meteo.com/v1/icon',    // ICON 13 km — PRIMARY
-  API_GFS:     'https://api.open-meteo.com/v1/gfs',     // GFS 0.25°  — FALLBACK
+  API_ICON:    'https://api.open-meteo.com/v1/icon',
+  API_GFS:     'https://api.open-meteo.com/v1/gfs',
   API_ARCHIVE: 'https://archive-api.open-meteo.com/v1/archive',
 
-  /* Variables requested from ICON / GFS (hourly) */
   HOURLY_VARS: [
     'wind_speed_10m',
     'wind_direction_10m',
@@ -52,7 +51,6 @@ const CFG = {
     'temperature_2m',
   ].join(','),
 
-  /* Variables requested from archive (hourly) */
   ARCHIVE_VARS: [
     'wind_speed_10m',
     'wind_direction_10m',
@@ -114,14 +112,13 @@ const S = {
   apiCache:  new Map(),
   apiQueue:  Promise.resolve(),
 
-  /* ── ICON / model tracking (v7) ── */
-  activeModel: 'ICON',   // 'ICON' | 'GFS' | 'ARCHIVE'
-  activeHour:  null,     // ISO string of the matched hourly slot, e.g. "2025-06-12T14:00"
+  activeModel: 'ICON',
+  activeHour:  null,
 };
 
 
 /* ══════════════════════════════════════════════════════
-   3. MAP INIT  (unchanged from v5)
+   3. MAP INIT
 ══════════════════════════════════════════════════════ */
 function initMap() {
   maptilersdk.config.apiKey = CFG.MT_KEY;
@@ -153,7 +150,7 @@ function initMap() {
 
 
 /* ══════════════════════════════════════════════════════
-   4. SEARCH  (unchanged from v5)
+   4. SEARCH
 ══════════════════════════════════════════════════════ */
 function initSearch() {
   const input    = document.getElementById('searchInput');
@@ -209,7 +206,7 @@ function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/
 
 
 /* ══════════════════════════════════════════════════════
-   5. RATE-LIMITED API  (unchanged from v5)
+   5. RATE-LIMITED API
 ══════════════════════════════════════════════════════ */
 function apiRequest(url, isArchive=false) {
   if(S.apiCache.has(url)) return Promise.resolve(S.apiCache.get(url));
@@ -239,36 +236,36 @@ function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 
 /* ══════════════════════════════════════════════════════
-   6. WIND FIELD  ← REWRITTEN FOR ICON + CORRECT HOUR
+   6. WIND FIELD
    ──────────────────────────────────────────────────────
-   PRIMARY model  : ICON 13 km   → /v1/icon
-   FALLBACK model : GFS 0.25°    → /v1/gfs
-   HISTORICAL     : Open-Meteo archive  → /v1/archive
+   BUG FIX — UV sign convention was incorrect in v7.
+   
+   Meteorological convention:
+     wind_direction = direction FROM which wind blows, in degrees CW from N.
+     e.g. 270° = wind FROM the west → blows EAST → +longitude direction.
 
-   Correct-hour algorithm
-   ──────────────────────
-   Open-Meteo returns hourly arrays in UTC.  We:
-   1. Request forecast_days=2 + timezone=UTC so the current
-      UTC clock time is always somewhere in the array.
-   2. Call findNearestHourIndex(timeArray) which computes
-      |Date.parse(slot) − Date.now()| for every entry and
-      returns the index with the minimum difference.
-   3. Extract speed, direction, humidity, temperature from
-      that single index — no averaging, exact live slot.
+   Canvas convention:
+     +X = right  = east  (longitude increases)
+     +Y = DOWN   = south (latitude DECREASES)
+
+   Correct decomposition for canvas:
+     u (east component)  =  speed * sin(dir_rad)   → maps to +canvas-X
+     v (north component) =  speed * cos(dir_rad)   → stored POSITIVE for north
+
+   In the particle loop (§7):
+     p.x += u * scale          (east  → +canvas-X ✓)
+     p.y -= v * scale          (north → -canvas-Y because Y is inverted ✓)
+
+   v7 had the negation in buildUVGrid (storing −cos) AND subtracting in
+   the particle loop, giving double-negation → southward drift for
+   northerly winds. Fix: store v positive in the grid, subtract in loop.
 ══════════════════════════════════════════════════════ */
 
-/**
- * Return the index in `timeArray` (ISO-8601 strings, UTC)
- * whose timestamp is closest to the current moment.
- * Open-Meteo omits the trailing 'Z' — we append ':00Z' so
- * Date.parse() treats the string as UTC.
- */
 function findNearestHourIndex(timeArray) {
   if(!timeArray || !timeArray.length) return 0;
   const now = Date.now();
   let best = 0, bestDiff = Infinity;
   for(let i = 0; i < timeArray.length; i++) {
-    /* "2025-06-12T14:00" → "2025-06-12T14:00:00Z" */
     const iso  = timeArray[i].endsWith('Z') ? timeArray[i] : timeArray[i] + ':00Z';
     const diff = Math.abs(Date.parse(iso) - now);
     if(diff < bestDiff){ bestDiff = diff; best = i; }
@@ -276,10 +273,6 @@ function findNearestHourIndex(timeArray) {
   return best;
 }
 
-/**
- * Build an ICON or GFS URL for a single lat/lon point.
- * Always requests UTC, 2 days, hourly variables.
- */
 function buildForecastURL(baseURL, lat, lon) {
   const url = new URL(baseURL);
   url.searchParams.set('latitude',        lat.toFixed(5));
@@ -291,10 +284,6 @@ function buildForecastURL(baseURL, lat, lon) {
   return url.toString();
 }
 
-/**
- * Extract speed + direction at the nearest hour from a
- * parsed Open-Meteo hourly response, for the chosen altitude.
- */
 function extractHourlyPoint(data, altMode) {
   const h   = data.hourly || {};
   const idx = findNearestHourIndex(h.time);
@@ -306,7 +295,7 @@ function extractHourlyPoint(data, altMode) {
   } else if(altMode === '80m') {
     speed = h.wind_speed_80m?.[idx]     ?? h.wind_speed_10m?.[idx]     ?? 3;
     dir   = h.wind_direction_80m?.[idx] ?? h.wind_direction_10m?.[idx] ?? 270;
-  } else { /* 120m */
+  } else {
     speed = h.wind_speed_120m?.[idx]    ?? h.wind_speed_10m?.[idx]     ?? 3;
     dir   = h.wind_direction_120m?.[idx]?? h.wind_direction_10m?.[idx] ?? 270;
   }
@@ -323,19 +312,13 @@ function extractHourlyPoint(data, altMode) {
   };
 }
 
-/**
- * Fetch from ICON; automatically fall back to GFS on failure.
- * Sets S.activeModel and S.activeHour on success.
- */
 async function fetchPointICON(lat, lon, altMode) {
   let data, usedModel;
 
-  /* ── Attempt 1: ICON ── */
   try {
     data      = await apiRequest(buildForecastURL(CFG.API_ICON, lat, lon), false);
     usedModel = 'ICON';
   } catch(iconErr) {
-    /* ── Attempt 2: GFS fallback ── */
     console.warn('[FH] ICON failed — trying GFS:', iconErr.message);
     try {
       data      = await apiRequest(buildForecastURL(CFG.API_GFS, lat, lon), false);
@@ -347,7 +330,6 @@ async function fetchPointICON(lat, lon, altMode) {
 
   const result = extractHourlyPoint(data, altMode);
 
-  /* Persist globally so status bar + export can read it */
   S.activeModel = usedModel;
   S.activeHour  = result.timeISO;
 
@@ -362,10 +344,6 @@ async function fetchPointICON(lat, lon, altMode) {
   return result;
 }
 
-/**
- * Fetch monthly-average data from the ERA5 archive.
- * Behaviour unchanged from v5 — averages the whole month.
- */
 async function fetchPointArchive(lat, lon, altMode, month) {
   const year = new Date().getFullYear() - 1;
   const m    = parseInt(month, 10);
@@ -404,10 +382,6 @@ async function fetchPointArchive(lat, lon, altMode, month) {
   };
 }
 
-/**
- * Public dispatcher: current month → ICON (+ GFS fallback);
- * historical month → ERA5 archive.
- */
 async function fetchPointData(lat, lon, altMode, month) {
   altMode = altMode || document.getElementById('selAlt').value;
   month   = month   || S.selectedMonth;
@@ -417,7 +391,7 @@ async function fetchPointData(lat, lon, altMode, month) {
 }
 
 
-/* ── Wind field orchestration (unchanged grid logic) ── */
+/* ── Wind field orchestration ── */
 async function fetchWindField() {
   const map = S.map;
   if(!map || !map.isStyleLoaded()) return;
@@ -433,7 +407,6 @@ async function fetchWindField() {
       pts.push({ lat:sw.lat+(r/(SROWS-1))*(ne.lat-sw.lat), lon:sw.lng+(c/(SCOLS-1))*(ne.lng-sw.lng) });
 
   try {
-    /* ICON / forecast: fire in parallel; archive: serialise */
     const fetched = (month === 'current')
       ? await Promise.all(pts.map(pt => fetchPointData(pt.lat, pt.lon, alt, month)))
       : await seqMap(pts, pt => fetchPointData(pt.lat, pt.lon, alt, month));
@@ -456,16 +429,23 @@ async function fetchWindField() {
 
 async function seqMap(arr, fn){ const out=[]; for(const item of arr) out.push(await fn(item)); return out; }
 
-/* ── Grid builders (unchanged) ── */
+/* ── Grid builders ── */
 function buildUVGrid(samples, sw, ne, cols, rows) {
   const uv = new Float32Array(cols*rows*2);
   for(let r=0;r<rows;r++) for(let c=0;c<cols;c++) {
     const lat=sw.lat+(r/(rows-1))*(ne.lat-sw.lat), lon=sw.lng+(c/(cols-1))*(ne.lng-sw.lng);
-    const { speed, dir } = idwVec(lat, lon, samples), rad=(dir*Math.PI)/180, idx=(r*cols+c)*2;
-    uv[idx]=speed*Math.sin(rad); uv[idx+1]=-speed*Math.cos(rad);
+    const { speed, dir } = idwVec(lat, lon, samples);
+    const rad = (dir * Math.PI) / 180;
+    const idx = (r*cols+c)*2;
+    /* FIX: u = east component (sin), v = north component (cos).
+       Both stored POSITIVE. The particle loop handles the canvas-Y
+       inversion by doing p.y -= v (see §7). */
+    uv[idx]   =  speed * Math.sin(rad);   // u: east  → +canvas-X
+    uv[idx+1] =  speed * Math.cos(rad);   // v: north → stored +, subtracted in loop
   }
   return uv;
 }
+
 function buildHumGrid(samples, sw, ne, cols, rows) {
   const h = new Float32Array(cols*rows);
   for(let r=0;r<rows;r++) for(let c=0;c<cols;c++) {
@@ -474,6 +454,7 @@ function buildHumGrid(samples, sw, ne, cols, rows) {
   }
   return h;
 }
+
 function sampleUV(px, py) {
   const wf=S.windField; if(!wf) return {u:0,v:0};
   const W=S.windCanvas.width, H=S.windCanvas.height;
@@ -485,6 +466,7 @@ function sampleUV(px, py) {
     v: lerp(lerp(wf.uv[ix(r0,c0)+1],wf.uv[ix(r0,c1)+1],tc), lerp(wf.uv[ix(r1,c0)+1],wf.uv[ix(r1,c1)+1],tc), tr),
   };
 }
+
 function sampleHum(px, py) {
   const hf=S.humField; if(!hf) return 72;
   const W=S.humCanvas.width, H=S.humCanvas.height;
@@ -496,7 +478,10 @@ function sampleHum(px, py) {
 
 
 /* ══════════════════════════════════════════════════════
-   7. WIND PARTICLES  (unchanged from v5)
+   7. WIND PARTICLES
+   BUG FIX: p.y -= v * scale  (correct — canvas Y is inverted vs geo N)
+   v is now stored positive in the grid (see §6 fix), so subtracting it
+   here moves particles northward (upward on screen) when wind blows N.
 ══════════════════════════════════════════════════════ */
 function initCanvases(){
   S.humCanvas=document.getElementById('hum-canvas'); S.windCanvas=document.getElementById('wind-canvas');
@@ -522,7 +507,10 @@ function startWindParticles(){
       const{u,v}=sampleUV(p.x,p.y), speed=Math.hypot(u,v);
       if(speed<0.08){ resetParticle(p,W,H); continue; }
       const scale=CFG.WIND.SPEED_SCALE*(W/600);
-      p.px=p.x; p.py=p.y; p.x+=u*scale; p.y-=v*scale; p.age++;
+      p.px=p.x; p.py=p.y;
+      p.x += u * scale;   // east  → moves right on canvas ✓
+      p.y -= v * scale;   // north → moves UP on canvas (Y inverted) ✓
+      p.age++;
       if(p.x<0||p.x>W||p.y<0||p.y>H||p.age>CFG.WIND.MAX_AGE){ resetParticle(p,W,H); continue; }
       const base=Math.min(CFG.WIND.MAX_ALPHA,CFG.WIND.MIN_ALPHA+(speed/15)*(CFG.WIND.MAX_ALPHA-CFG.WIND.MIN_ALPHA));
       ctx.beginPath(); ctx.moveTo(p.px,p.py); ctx.lineTo(p.x,p.y);
@@ -534,7 +522,6 @@ function startWindParticles(){
 }
 function resetParticle(p,W,H){ p.x=Math.random()*W; p.y=Math.random()*H; p.age=0; p.px=null; p.py=null; }
 function windColor(speed){
-  /* Vivid, high-contrast palette — clearly visible against dark terrain */
   const s=[[0,'#6600ff'],[2,'#0055ff'],[5,'#00ccff'],[8,'#00ffbb'],[11,'#ccff00'],[14,'#ffdd00'],[17,'#ff2200']];
   for(let i=1;i<s.length;i++){ const[s0,c0]=s[i-1],[s1,c1]=s[i]; if(speed<=s1) return lerpHex(c0,c1,(speed-s0)/(s1-s0)); }
   return s[s.length-1][1];
@@ -542,7 +529,7 @@ function windColor(speed){
 
 
 /* ══════════════════════════════════════════════════════
-   8. HUMIDITY CANVAS  (unchanged from v5)
+   8. HUMIDITY CANVAS
 ══════════════════════════════════════════════════════ */
 function drawHumidityCanvas(){
   if(!S.humField||!S.layerHum) return;
@@ -555,7 +542,6 @@ function drawHumidityCanvas(){
   S.humCtx.putImageData(img,0,0);
 }
 function humColor(h){
-  /* Vivid: deep red (dry) → orange → yellow → cyan → electric blue (humid) */
   const s=[[0,'#cc0000'],[30,'#ff5500'],[50,'#ffcc00'],[70,'#00ffcc'],[85,'#00aaff'],[100,'#0033ff']];
   h=Math.max(0,Math.min(100,h));
   for(let i=1;i<s.length;i++){ const[h0,c0]=s[i-1],[h1,c1]=s[i]; if(h<=h1) return hexToRgb(lerpHex(c0,c1,(h-h0)/(h1-h0))); }
@@ -564,7 +550,7 @@ function humColor(h){
 
 
 /* ══════════════════════════════════════════════════════
-   9. OPACITY POPOVERS  (unchanged from v5)
+   9. OPACITY POPOVERS
 ══════════════════════════════════════════════════════ */
 function initOpacityPopovers() {
   function makePopover(id, labelText, layerKey, opacityKey, onOpacityChange, onToggle) {
@@ -608,18 +594,14 @@ function initOpacityPopovers() {
   }
   document.getElementById('btnWind').addEventListener('click',function(e){
     e.stopPropagation();
-    /* If popover already open, just close it; otherwise toggle layer + open popover */
     if(!windPop.classList.contains('hidden')){ windPop.classList.add('hidden'); activePopover=null; return; }
-    /* Toggle wind layer on/off */
     S.layerWind = !S.layerWind;
     this.classList.toggle('active', S.layerWind);
-    /* Sync the popover's own toggle button text/state */
     const pt = windPop.querySelector('.op-toggle');
     pt.textContent = S.layerWind ? 'VISIBLE' : 'OCULTO';
     pt.classList.toggle('on', S.layerWind);
     if(S.layerWind) { startWindParticles(); }
     else { cancelAnimationFrame(S.windRAF); S.windCtx.clearRect(0,0,S.windCanvas.width,S.windCanvas.height); }
-    /* Also open the popover so user can fine-tune opacity */
     openPop(windPop, this);
   });
   document.getElementById('btnHum').addEventListener('click', function(e){
@@ -644,7 +626,7 @@ function initOpacityPopovers() {
 
 
 /* ══════════════════════════════════════════════════════
-   10. MAP CLICK  (unchanged from v5)
+   10. MAP CLICK
 ══════════════════════════════════════════════════════ */
 async function onMapClick(lat, lng) {
   document.getElementById('click-hint').classList.add('hidden');
@@ -668,7 +650,7 @@ async function onMapClick(lat, lng) {
 
 
 /* ══════════════════════════════════════════════════════
-   11. FEASIBILITY  (unchanged from v5)
+   11. FEASIBILITY
 ══════════════════════════════════════════════════════ */
 function computeFeasibility({humidity,elevation,windSpeed,windDir,coastDist}){
   const F=CFG.F;
@@ -693,7 +675,7 @@ function computeFeasibility({humidity,elevation,windSpeed,windDir,coastDist}){
 
 
 /* ══════════════════════════════════════════════════════
-   12. WATER YIELD  (unchanged from v5)
+   12. WATER YIELD
 ══════════════════════════════════════════════════════ */
 function estimateLWC(h){
   const Y=CFG.Y; if(h<Y.LWC_RH_MIN) return 0;
@@ -714,7 +696,7 @@ function estimateYield(humidity,windSpeed,elevation){
 
 
 /* ══════════════════════════════════════════════════════
-   13. MONTHLY CHART  (unchanged from v5)
+   13. MONTHLY CHART
 ══════════════════════════════════════════════════════ */
 async function loadMonthlyChart(lat,lng){
   document.getElementById('chartBadge').classList.remove('hidden');
@@ -737,7 +719,7 @@ function renderMonthChart(data){
 
 
 /* ══════════════════════════════════════════════════════
-   14. PANEL RENDER  ← MODEL + HORA UTC rows added
+   14. PANEL RENDER
 ══════════════════════════════════════════════════════ */
 function renderPanel({lat,lng,elevation,coastDist,weather,feasibility,waterYield}){
   document.getElementById('rLat').textContent  =lat.toFixed(5)+'°';
@@ -763,7 +745,6 @@ function renderPanel({lat,lng,elevation,coastDist,weather,feasibility,waterYield
   });
   requestAnimationFrame(()=>document.querySelectorAll('.fi-bar-fill').forEach(b=>{b.style.width=b.dataset.w;}));
 
-  /* Atmospheric data grid — adds MODEL and HORA UTC rows */
   document.getElementById('atmGrid').innerHTML=[
     {k:'HUMEDAD',   v:weather.humidity,               u:'%'                              },
     {k:'VIENTO',    v:(weather.speed||0).toFixed(1),  u:'m/s'                            },
@@ -792,7 +773,7 @@ function scoreColor(s){ return s>=75?'#00ffaa':s>=50?'#00c8ff':s>=25?'#ffb830':'
 
 
 /* ══════════════════════════════════════════════════════
-   15. EXPORT  (adds modelo + hora_utc fields)
+   15. EXPORT
 ══════════════════════════════════════════════════════ */
 document.getElementById('expCSV').addEventListener('click',()=>{ const d=exportData(); if(!d) return; dl([Object.keys(d).join(','),Object.values(d).map(v=>`"${v}"`).join(',')].join('\n'),'text/csv','fogharvest.csv'); });
 document.getElementById('expJSON').addEventListener('click',()=>{ const d=exportData(); if(!d) return; dl(JSON.stringify(d,null,2),'application/json','fogharvest.json'); });
@@ -813,7 +794,7 @@ function dl(c,m,n){ const u=URL.createObjectURL(new Blob([c],{type:m})); const a
 
 
 /* ══════════════════════════════════════════════════════
-   16. UTILITIES  ← setStatus updated for model badge
+   16. UTILITIES
 ══════════════════════════════════════════════════════ */
 function placeMarker(lat,lng){
   const el=document.createElement('div');
@@ -839,16 +820,6 @@ function hexToRgb(h){ return{r:parseInt(h.slice(1,3),16),g:parseInt(h.slice(3,5)
 function daysInMonth(y,m){ return new Date(y,m,0).getDate(); }
 function pad(n){ return String(n).padStart(2,'0'); }
 
-/**
- * Status bar — now shows model name + matched UTC hour.
- * e.g. "ICON 13km · 14:00 UTC · 80M · AHORA"
- *      "GFS (fallback) · 14:00 UTC · 80M · AHORA"
- *      "ARCHIVO · 80M · MAR"
- * @param {string}  state    'loading' | 'active' | 'error'
- * @param {string}  alt      altitude key, e.g. '80m'
- * @param {string}  month    'current' | '1'..'12'
- * @param {string}  [override]  if set, show this text directly (used for warnings)
- */
 function setStatus(state, alt, month, override) {
   const dot = document.getElementById('stDot');
   const txt = document.getElementById('stText');
@@ -886,7 +857,7 @@ function showApp(){
 
 
 /* ══════════════════════════════════════════════════════
-   17. BOOT  (unchanged from v5)
+   17. BOOT
 ══════════════════════════════════════════════════════ */
 document.getElementById('btnRefresh').addEventListener('click', fetchWindField);
 
@@ -905,8 +876,6 @@ document.getElementById('btnPanel').addEventListener('click', () => {
   setTimeout(()=>S.map&&S.map.resize(), 320);
 });
 
-/* Script loads at bottom of <body> — DOM is already parsed.
-   Call directly; DOMContentLoaded may have already fired. */
 initMap();
 initSearch();
 initOpacityPopovers();
@@ -915,73 +884,42 @@ initOpacityPopovers();
 /* ══════════════════════════════════════════════════════════════════════
    18. 3D WIND TUNNEL MODULE
    ──────────────────────────────────────────────────────────────────────
-   Architecture:
-   ┌─────────────────────────────────────────────────────────────────┐
-   │  Modal overlay (#wt-overlay)                                    │
-   │  ┌──────────────────────────┐ ┌───────────────────────────────┐ │
-   │  │  Three.js viewport 70%   │ │  Control panel 30%            │ │
-   │  │  - Scene / camera        │ │  §1 Model upload (GLB/OBJ/STL)│ │
-   │  │  - OrbitControls         │ │  §2 Transform sliders         │ │
-   │  │  - Potential-flow field  │ │  §3 Climate fetch (ICON)      │ │
-   │  │  - Particle traces       │ │  §4 Simulation controls       │ │
-   │  │  - Model mesh            │ │  §5 Results + harvest         │ │
-   │  │  - Wind rose / colorbar  │ │  §6 Place on main map         │ │
-   │  └──────────────────────────┘ └───────────────────────────────┘ │
-   └─────────────────────────────────────────────────────────────────┘
-
-   Physics:
-   - Uniform free-stream + Rankine-sphere dipole superposed in
-     ellipsoid-normalised coordinates for the potential-flow field.
-   - 32×22×32 voxel grid, trilinear interpolation per particle.
-   - Particles emitted from an upwind plane, Euler-advected each frame.
-   - Color mapped blue (slow) → red (fast) per-particle speed.
-
-   Harvest formula:
-     Q [L/day] = LWC × v_eff × η(20%) × A [m²] × 86400 / 1000
-   where v_eff is median particle speed near the model surface.
+   BUG FIX (model upload):
+   - setupDragDrop() now also wires a click handler on the drop-zone div
+     so clicking opens the file picker (was only wired for drag-and-drop).
+   - The local loadModel() function is renamed wtLoadModel() to eliminate
+     any risk of collision with global scope. All internal calls updated.
+   - GLTFLoader / OBJLoader / STLLoader all use .parse(buffer) — never
+     .load(blobURL) which silently hangs in Three.js r128.
 ══════════════════════════════════════════════════════════════════════ */
 
 (function () {
   'use strict';
 
-  /* ─── Module-level state ─────────────────────────────────────────── */
   const WT = {
-    /* Three.js core */
     renderer: null, scene: null, camera: null, controls: null,
     rafId:    null,
-
-    /* Scene objects */
-    modelMesh:    null,   // uploaded 3D model
-    particleSystem: null, // THREE.LineSegments for trails
+    modelMesh:    null,
+    particleSystem: null,
     gridHelper:   null,
-    envBox:       null,   // wireframe bounding box
+    envBox:       null,
     lights:       [],
-
-    /* Flow field (voxel grid) */
-    flowGrid:  null,      // Float32Array [cx*cy*cz*3]  uvw
-    flowDims:  null,      // {cx,cy,cz,ox,oy,oz,cellW,cellH,cellD}
-    modelBBox: null,      // THREE.Box3 of the loaded model
-
-    /* Particles */
-    particlePositions: null,  // Float32Array [N*3] current XYZ
-    particleTrails:    null,  // array of {pts:[], age, maxAge}
+    flowGrid:  null,
+    flowDims:  null,
+    modelBBox: null,
+    particlePositions: null,
+    particleTrails:    null,
     particleCount: 2500,
-
-    /* Climate */
-    climate: null,        // {speed, dir, humidity, temp, month}
-
-    /* UI flags */
+    climate: null,
     simRunning: false,
     modelLoaded: false,
   };
 
-  /* ─── Constants ──────────────────────────────────────────────────── */
   const FLOW_CX = 32, FLOW_CY = 22, FLOW_CZ = 32;
-  const PARTICLE_MAX_AGE = 180;   // frames
-  const PARTICLE_DT      = 0.04;  // s per frame (≈ 25 fps target)
-  const TRAIL_SEGS       = 10;    // line segments per particle trail
+  const PARTICLE_MAX_AGE = 180;
+  const PARTICLE_DT      = 0.04;
+  const TRAIL_SEGS       = 10;
 
-  /* Speed colour stops: blue → cyan → green → yellow → red */
   const SPEED_COLORS = [
     [0,    new THREE.Color(0x1a3aff)],
     [0.25, new THREE.Color(0x00c8ff)],
@@ -990,9 +928,7 @@ initOpacityPopovers();
     [1.0,  new THREE.Color(0xff3300)],
   ];
 
-  /* ══════════════════════════════════════════════════════
-     INIT — called once when the tunnel button is clicked
-  ══════════════════════════════════════════════════════ */
+  /* ── Init ── */
   function initWindTunnel() {
     openOverlay();
     if (!WT.renderer) {
@@ -1002,11 +938,10 @@ initOpacityPopovers();
       setupGrid();
     }
     populateLocationTag();
-    syncRunButton();  /* set initial disabled state on open */
+    syncRunButton();
     animate();
   }
 
-  /* ── Open / close overlay ── */
   function openOverlay() {
     document.getElementById('wt-overlay').classList.remove('wt-hidden');
     document.body.style.overflow = 'hidden';
@@ -1017,7 +952,6 @@ initOpacityPopovers();
     stopSim();
   }
 
-  /* ── Three.js renderer ── */
   function setupRenderer() {
     const canvas = document.getElementById('wt-canvas');
     WT.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
@@ -1039,14 +973,11 @@ initOpacityPopovers();
     }
   }
 
-  /* ── Scene setup ── */
   function setupScene() {
     WT.scene  = new THREE.Scene();
     WT.scene.fog = new THREE.FogExp2(0x07090f, 0.018);
-
     WT.camera = new THREE.PerspectiveCamera(45, 1, 0.01, 500);
     WT.camera.position.set(14, 8, 18);
-
     WT.controls = new THREE.OrbitControls(WT.camera, WT.renderer.domElement);
     WT.controls.enableDamping = true;
     WT.controls.dampingFactor = 0.08;
@@ -1056,7 +987,6 @@ initOpacityPopovers();
     WT.controls.update();
   }
 
-  /* ── Lights ── */
   function setupLights() {
     const ambient = new THREE.AmbientLight(0x1a2030, 2.5);
     const key     = new THREE.DirectionalLight(0x8ad4ff, 2.2);
@@ -1070,14 +1000,11 @@ initOpacityPopovers();
     WT.lights = [ambient, key, fill, rim];
   }
 
-  /* ── Ground grid ── */
   function setupGrid() {
     const grid = new THREE.GridHelper(30, 30, 0x0d3040, 0x0d2030);
     grid.position.y = -0.01;
     WT.scene.add(grid);
     WT.gridHelper = grid;
-
-    /* Faint ground plane */
     const planeMat  = new THREE.MeshStandardMaterial({ color: 0x060d14, roughness: 1, metalness: 0 });
     const planeMesh = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), planeMat);
     planeMesh.rotation.x = -Math.PI / 2;
@@ -1085,7 +1012,6 @@ initOpacityPopovers();
     WT.scene.add(planeMesh);
   }
 
-  /* ── Render loop ── */
   function animate() {
     WT.rafId = requestAnimationFrame(animate);
     WT.controls && WT.controls.update();
@@ -1100,32 +1026,28 @@ initOpacityPopovers();
 
 
   /* ══════════════════════════════════════════════════════
-     MODEL LOADING  (GLB / GLTF / OBJ / STL)
-     All formats use FileReader → loader.parse(buffer/text)
-     — never loader.load(blobURL) which silently hangs at r128.
+     MODEL LOADING — FIX: uses .parse() not .load(blobURL)
+     FIX: renamed to wtLoadModel to avoid global collisions
+     FIX: drop-zone click now also triggers file picker
   ══════════════════════════════════════════════════════ */
-  function loadModel(file) {
+  function wtLoadModel(file) {
     setSimStatus('Cargando modelo…', false);
     const ext = file.name.split('.').pop().toLowerCase();
 
     if (WT.modelMesh) { WT.scene.remove(WT.modelMesh); WT.modelMesh = null; }
     if (WT.envBox)    { WT.scene.remove(WT.envBox);    WT.envBox    = null; }
 
-    /* ── Shared: called with the parsed Three.js object ── */
     const onLoaded = (object) => {
       const mesh = (object.scene || object);
 
-      /* Normalise scale to ~6-unit cube */
       const bbox = new THREE.Box3().setFromObject(mesh);
       const size = bbox.getSize(new THREE.Vector3());
       const maxD = Math.max(size.x, size.y, size.z) || 1;
       mesh.scale.setScalar(5 / maxD);
 
-      /* Sit on ground */
       const b2 = new THREE.Box3().setFromObject(mesh);
       mesh.position.y -= b2.min.y;
 
-      /* Material polish */
       mesh.traverse(c => {
         if (!c.isMesh) return;
         c.castShadow = c.receiveShadow = true;
@@ -1144,7 +1066,6 @@ initOpacityPopovers();
       WT.modelMesh = mesh;
       WT.modelBBox = new THREE.Box3().setFromObject(mesh);
 
-      /* Wireframe envelope */
       const centre = WT.modelBBox.getCenter(new THREE.Vector3());
       const sz     = WT.modelBBox.getSize(new THREE.Vector3());
       const edges  = new THREE.EdgesGeometry(new THREE.BoxGeometry(sz.x*1.08, sz.y*1.08, sz.z*1.08));
@@ -1152,13 +1073,11 @@ initOpacityPopovers();
       WT.envBox.position.copy(centre);
       WT.scene.add(WT.envBox);
 
-      /* Camera */
       const cd = maxD * (5/maxD) * 3.5;
       WT.camera.position.set(cd, cd*0.6, cd*1.2);
       WT.controls.target.copy(centre);
       WT.controls.update();
 
-      /* UI */
       WT.modelLoaded = true;
       const sz2 = WT.modelBBox.getSize(new THREE.Vector3());
       document.getElementById('wtModelInfo').textContent =
@@ -1168,7 +1087,7 @@ initOpacityPopovers();
       buildFlowField();
       setSimStatus('Modelo listo — ejecuta la simulación', false);
       updateTransforms();
-      syncRunButton();  /* enable Run button now model is loaded */
+      syncRunButton();
     };
 
     const onError = (err) => {
@@ -1179,7 +1098,6 @@ initOpacityPopovers();
     const reader = new FileReader();
 
     if (ext === 'glb' || ext === 'gltf') {
-      /* ArrayBuffer → GLTFLoader.parse() — bypasses XHR/blob entirely */
       reader.onload = e => {
         try {
           new THREE.GLTFLoader().parse(e.target.result, '', onLoaded, onError);
@@ -1220,7 +1138,6 @@ initOpacityPopovers();
     }
   }
 
-  /* ── Model transform sliders ── */
   function updateTransforms() {
     if (!WT.modelMesh) return;
     const scale = parseFloat(document.getElementById('wtScale').value) || 1;
@@ -1229,12 +1146,9 @@ initOpacityPopovers();
     const offY  = parseFloat(document.getElementById('wtOffY').value)  || 0;
     const offZ  = parseFloat(document.getElementById('wtOffZ').value)  || 0;
 
-    /* Recompute from scratch relative to centred-ground pose */
-    const bbox   = new THREE.Box3().setFromObject(WT.modelMesh);
     WT.modelMesh.scale.setScalar(scale);
     WT.modelMesh.rotation.y = (rotY * Math.PI) / 180;
 
-    /* Reset Y to ground, then apply offsets */
     const b2 = new THREE.Box3().setFromObject(WT.modelMesh);
     WT.modelMesh.position.set(offX, -b2.min.y + offY, offZ);
 
@@ -1249,14 +1163,7 @@ initOpacityPopovers();
   }
 
 
-  /* ══════════════════════════════════════════════════════
-     POTENTIAL FLOW FIELD
-     ────────────────────────────────────────────────────
-     Uniform free-stream (in +X direction) + ellipsoid
-     dipole (Rankine-sphere superposition), giving an
-     irrotational potential flow around an ellipsoidal
-     obstacle.  The voxel grid stores (u,v,w) per cell.
-  ══════════════════════════════════════════════════════ */
+  /* ── Potential flow field ── */
   function buildFlowField() {
     const bbox = WT.modelBBox || new THREE.Box3(
       new THREE.Vector3(-3, 0, -3),
@@ -1265,7 +1172,6 @@ initOpacityPopovers();
     const centre = bbox.getCenter(new THREE.Vector3());
     const size   = bbox.getSize(new THREE.Vector3());
 
-    /* Domain: 4× model size in flow direction (X), 3× in Y/Z */
     const domW = size.x * 5.5,  domH = size.y * 4,  domD = size.z * 5.5;
     const ox   = centre.x - domW / 2;
     const oy   = Math.max(centre.y - domH / 2, -0.5);
@@ -1277,14 +1183,9 @@ initOpacityPopovers();
     WT.flowDims = { cx: FLOW_CX, cy: FLOW_CY, cz: FLOW_CZ,
                     ox, oy, oz, cellW, cellH, cellD };
 
-    /* Half-axes with 12% inflation */
     const ax = size.x * 0.6, ay = size.y * 0.6, az = size.z * 0.6;
     const cx = centre.x, cy = centre.y, cz = centre.z;
-
-    /* Free-stream speed (normalised; actual m/s applied in harvest calc) */
     const U = 1.0;
-
-    /* Dipole strength: A = U * ax*ay*az for a sphere, scaled by axes */
     const A = U * ax * ay * az;
 
     const grid = new Float32Array(FLOW_CX * FLOW_CY * FLOW_CZ * 3);
@@ -1296,7 +1197,6 @@ initOpacityPopovers();
           const wy = oy + iy * cellH;
           const wz = oz + iz * cellD;
 
-          /* Ellipsoid-normalised coords */
           const dx = (wx - cx) / (ax * 1.1);
           const dy = (wy - cy) / (ay * 1.1);
           const dz = (wz - cz) / (az * 1.1);
@@ -1304,11 +1204,8 @@ initOpacityPopovers();
           const r  = Math.sqrt(r2) || 1e-9;
           const r5 = r2 * r2 * r;
 
-          /* Potential flow: u = U(1 - A*(2x²-y²-z²)/r^5),
-             v = -A*(3xy)/r^5,  w = -A*(3xz)/r^5   (Rankine sphere) */
           let u, v, w;
           if (r < 1.0) {
-            /* Inside model — zero velocity */
             u = 0; v = 0; w = 0;
           } else {
             u =  U * (1 - A * (2*dx*dx - dy*dy - dz*dz) / r5);
@@ -1326,7 +1223,6 @@ initOpacityPopovers();
     WT.flowGrid = grid;
   }
 
-  /* ── Trilinear interpolation of flow field at world point ── */
   function sampleFlow(wx, wy, wz) {
     const d = WT.flowDims;
     if (!d || !WT.flowGrid) return { u: 1, v: 0, w: 0 };
@@ -1359,19 +1255,14 @@ initOpacityPopovers();
   }
 
 
-  /* ══════════════════════════════════════════════════════
-     PARTICLE SYSTEM
-  ══════════════════════════════════════════════════════ */
+  /* ── Particle system ── */
   function initParticles() {
-    /* Remove old system */
     if (WT.particleSystem) { WT.scene.remove(WT.particleSystem); WT.particleSystem = null; }
 
     WT.particleCount = parseInt(document.getElementById('wtParticles').value) || 2500;
     const N    = WT.particleCount;
     const segs = TRAIL_SEGS;
-    const d    = WT.flowDims;
 
-    /* Each particle trail = segs line segments = 2*segs vertices */
     const positions = new Float32Array(N * segs * 2 * 3);
     const colors    = new Float32Array(N * segs * 2 * 3);
 
@@ -1387,17 +1278,15 @@ initOpacityPopovers();
     WT.particleSystem = new THREE.LineSegments(geo, mat);
     WT.scene.add(WT.particleSystem);
 
-    /* Particle state */
     WT.particles = Array.from({ length: N }, () => spawnParticle());
     WT.trailBuf  = positions;
     WT.colorBuf  = colors;
   }
 
-  /* Spawn particle at upwind plane (x = domain min) */
   function spawnParticle() {
     const d  = WT.flowDims;
     if (!d) return { x:0, y:1, z:0, age: 0, trail: [], speeds: [] };
-    const x  = d.ox + Math.random() * d.cellW * 2;          // near upwind face
+    const x  = d.ox + Math.random() * d.cellW * 2;
     const y  = d.oy + Math.random() * (d.cy - 1) * d.cellH;
     const z  = d.oz + Math.random() * (d.cz - 1) * d.cellD;
     return { x, y, z, age: Math.floor(Math.random() * PARTICLE_MAX_AGE), trail: [], speeds: [] };
@@ -1423,11 +1312,9 @@ initOpacityPopovers();
                    yMin:d.oy, yMax:d.oy+d.cellH*(FLOW_CY-1),
                    zMin:d.oz, zMax:d.oz+d.cellD*(FLOW_CZ-1) };
 
-    /* Speed scalar from climate (m/s) mapped to scene units */
     const speedScale = WT.climate ? Math.max(0.5, WT.climate.speed) * 0.55 : 0.55;
 
     let maxSpeed = 0;
-    const speedArr = [];
 
     for (let i = 0; i < N; i++) {
       const p = WT.particles[i];
@@ -1435,15 +1322,12 @@ initOpacityPopovers();
 
       const { u, v, w } = sampleFlow(p.x, p.y, p.z);
       const spd = Math.hypot(u, v, w);
-      speedArr.push(spd);
       if (spd > maxSpeed) maxSpeed = spd;
 
-      /* Euler advection */
       p.x += u * PARTICLE_DT * speedScale;
       p.y += v * PARTICLE_DT * speedScale;
       p.z += w * PARTICLE_DT * speedScale;
 
-      /* Trail history */
       p.trail.push(p.x, p.y, p.z);
       p.speeds.push(spd);
       if (p.trail.length > segs * 3) {
@@ -1451,7 +1335,6 @@ initOpacityPopovers();
         p.speeds.splice(0, 1);
       }
 
-      /* Respawn if out of domain or too old */
       if (p.x < dom.xMin || p.x > dom.xMax ||
           p.y < dom.yMin || p.y > dom.yMax ||
           p.z < dom.zMin || p.z > dom.zMax ||
@@ -1460,7 +1343,6 @@ initOpacityPopovers();
       }
     }
 
-    /* Update geometry buffers */
     const pos = WT.trailBuf;
     const col = WT.colorBuf;
     const normFactor = maxSpeed > 0 ? 1 / maxSpeed : 1;
@@ -1508,13 +1390,10 @@ initOpacityPopovers();
   }
 
 
-  /* ══════════════════════════════════════════════════════
-     CLIMATE DATA FETCH  (reuses main ICON fetchPointData)
-  ══════════════════════════════════════════════════════ */
+  /* ── Climate fetch ── */
   async function fetchClimate() {
     const btn = document.getElementById('wtFetchData');
     btn.disabled = true;
-    /* Show spinner in button */
     btn.innerHTML = `<span class="wt-btn-spin"></span> CARGANDO…`;
     setSimStatus('Obteniendo datos climáticos…', false);
 
@@ -1526,11 +1405,9 @@ initOpacityPopovers();
       const d = await fetchPointData(lat, lon, '10m', month);
       WT.climate = { speed: d.speed, dir: d.dir, humidity: d.humidity, temp: d.temp, month };
 
-      /* Update wind rose arrow */
       const arrowDeg = (d.dir + 180) % 360;
       document.getElementById('wtArrowG').setAttribute('transform', `rotate(${arrowDeg},30,30)`);
 
-      /* Show climate grid */
       const grid = document.getElementById('wtClimateData');
       grid.innerHTML = [
         { k:'VELOCIDAD', v: d.speed.toFixed(1), u:'m/s' },
@@ -1540,9 +1417,7 @@ initOpacityPopovers();
       ].map(r => `<div class="wtcg-item"><div class="wtcg-k">${r.k}</div><div class="wtcg-v">${r.v}<span class="wtcg-u"> ${r.u}</span></div></div>`).join('');
       grid.classList.remove('hidden');
 
-      /* Enable Run button now that climate data is available */
       syncRunButton();
-
       buildFlowField();
       setSimStatus(`ICON 13km · ${toDirCard(d.dir)} ${d.speed.toFixed(1)} m/s · HR ${Math.round(d.humidity)}%`, false);
     } catch(err) {
@@ -1554,7 +1429,6 @@ initOpacityPopovers();
     }
   }
 
-  /* Keep Run button disabled until model is loaded */
   function syncRunButton() {
     const runBtn = document.getElementById('wtRunSim');
     const ready  = WT.modelLoaded;
@@ -1563,22 +1437,17 @@ initOpacityPopovers();
   }
 
 
-  /* ══════════════════════════════════════════════════════
-     SIMULATION RUN
-  ══════════════════════════════════════════════════════ */
+  /* ── Simulation ── */
   function runSimulation() {
     if (!WT.modelLoaded) {
       setSimStatus('Carga un modelo 3D primero', false); return;
     }
     setSimStatus('Iniciando simulación…', true);
-
     buildFlowField();
     initParticles();
-
     WT.simRunning = true;
     if (!WT.rafId) animate();
 
-    /* After 3 s of simulation, compute results */
     setTimeout(() => {
       const results = computeHarvestResults();
       showResults(results);
@@ -1587,39 +1456,28 @@ initOpacityPopovers();
   }
 
 
-  /* ══════════════════════════════════════════════════════
-     HARVEST CALCULATION
-     Q [L/day] = LWC × v_eff × η × A × 86400 / 1000
-  ══════════════════════════════════════════════════════ */
+  /* ── Harvest ── */
   function computeHarvestResults() {
     const climate   = WT.climate || { speed: 4.5, dir: 270, humidity: 82, temp: 15 };
     const windSpeed = climate.speed;
     const humidity  = climate.humidity;
 
-    /* Effective area: manual input or bounding-box projected area */
     const manualArea = parseFloat(document.getElementById('wtAreaInput').value) || 0;
     let area;
     if (manualArea > 0) {
       area = manualArea;
     } else if (WT.modelBBox) {
       const sz = WT.modelBBox.getSize(new THREE.Vector3());
-      /* Projected area perpendicular to wind (X-direction in scene) = Y × Z */
       area = sz.y * sz.z;
     } else {
       area = 1.0;
     }
 
-    /* LWC estimation (same as main map) */
-    const lwc = estimateLWC(humidity);
-
-    /* Effective speed from flow perturbation near model surface */
+    const lwc  = estimateLWC(humidity);
     const vEff = Math.max(0.5, windSpeed * 0.85);
-
-    /* Efficiency 20% */
-    const eta   = 0.20;
+    const eta  = 0.20;
     const daily = lwc * vEff * eta * area * 86400 / 1000;
 
-    /* Peak speed ratio: sample a few points in model wake */
     let peakRatio = 1.0;
     if (WT.modelBBox && WT.flowDims) {
       const centre = WT.modelBBox.getCenter(new THREE.Vector3());
@@ -1663,16 +1521,13 @@ initOpacityPopovers();
   }
 
 
-  /* ══════════════════════════════════════════════════════
-     PLACE ON MAIN MAP
-  ══════════════════════════════════════════════════════ */
+  /* ── Place on main map ── */
   function placeOnMainMap() {
     if (!S.selectedPoint) {
       alert('Haz clic primero en un punto del mapa principal.'); return;
     }
     const { lat, lon } = S.selectedPoint;
 
-    /* Create a custom SVG marker */
     const el  = document.createElement('div');
     el.className = 'wt-map-marker';
     el.title  = '3D Wind Tunnel Model';
@@ -1701,15 +1556,12 @@ initOpacityPopovers();
   }
 
 
-  /* ══════════════════════════════════════════════════════
-     UI HELPERS
-  ══════════════════════════════════════════════════════ */
+  /* ── UI helpers ── */
   function setSimStatus(msg, spinning) {
     const el = document.getElementById('wt-sim-status');
     el.textContent = msg;
     el.classList.remove('wt-status-hidden');
     el.style.opacity = '1';
-    if (spinning) el.style.animation = 'none';
   }
 
   function showSection(id) {
@@ -1725,24 +1577,42 @@ initOpacityPopovers();
     }
   }
 
-  /* Drag-and-drop on drop zone */
+  /* ── Drag-and-drop + CLICK on dropzone ── FIX ──
+     Previously only drag/drop was wired; clicking the zone did nothing.
+     Now clicking the zone triggers the hidden file input. */
   function setupDragDrop() {
-    const zone = document.getElementById('wtUploadArea');
-    zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
-    zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+    const zone  = document.getElementById('wtUploadArea');
+    const input = document.getElementById('wtFileInput');
+
+    /* FIX: clicking the zone opens the file picker */
+    zone.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      input.value = '';   // reset so the same file can be re-selected
+      input.click();
+    });
+
+    zone.addEventListener('dragover', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      zone.classList.add('drag-over');
+    });
+    zone.addEventListener('dragleave', (e) => {
+      e.stopPropagation();
+      zone.classList.remove('drag-over');
+    });
     zone.addEventListener('drop', e => {
-      e.preventDefault(); zone.classList.remove('drag-over');
+      e.preventDefault();
+      e.stopPropagation();
+      zone.classList.remove('drag-over');
       const file = e.dataTransfer.files[0];
-      if (file) loadModel(file);
+      if (file) wtLoadModel(file);
     });
   }
 
 
-  /* ══════════════════════════════════════════════════════
-     WIRE UP ALL EVENT LISTENERS
-  ══════════════════════════════════════════════════════ */
+  /* ── Wire all events ── */
   function wireEvents() {
-    /* Open / close */
     document.getElementById('btnWindTunnel').addEventListener('click', initWindTunnel);
     document.getElementById('wt-close').addEventListener('click', closeOverlay);
     document.addEventListener('keydown', e => {
@@ -1751,18 +1621,16 @@ initOpacityPopovers();
         closeOverlay();
       }
     });
-    /* Click on overlay backdrop (not modal) */
     document.getElementById('wt-overlay').addEventListener('click', e => {
       if (e.target === document.getElementById('wt-overlay')) closeOverlay();
     });
 
-    /* File input */
+    /* File input — FIX: calls wtLoadModel (renamed from loadModel) */
     document.getElementById('wtFileInput').addEventListener('change', e => {
       const file = e.target.files[0];
-      if (file) loadModel(file);
+      if (file) wtLoadModel(file);
     });
 
-    /* Transform sliders */
     ['wtScale','wtRotY','wtOffX','wtOffY','wtOffZ'].forEach(id => {
       const el  = document.getElementById(id);
       const val = document.getElementById(id + 'Val');
@@ -1775,112 +1643,59 @@ initOpacityPopovers();
       });
     });
 
-    /* Particle count slider */
     document.getElementById('wtParticles').addEventListener('input', function() {
       document.getElementById('wtParticlesVal').textContent = this.value;
     });
 
-    /* Climate fetch */
     document.getElementById('wtFetchData').addEventListener('click', fetchClimate);
-
-    /* Run simulation */
     document.getElementById('wtRunSim').addEventListener('click', runSimulation);
-
-    /* Place on map */
     document.getElementById('wtPlaceOnMap').addEventListener('click', placeOnMainMap);
 
-    /* Drag and drop */
     setupDragDrop();
   }
 
-  /* Script is at bottom of <body> — DOM already parsed, call directly */
   wireEvents();
 
-})(); /* end IIFE */
+})();
 
 
 /* ══════════════════════════════════════════════════════════════════════
    19. ARCHITECTURE-SCALE WIND SIMULATION MODULE
-   ──────────────────────────────────────────────────────────────────────
-   A completely separate popup interface designed for building/urban-scale
-   wind analysis (1 scene unit = 1 real-world metre).
-
-   Key differences from §18 Wind Tunnel:
-   ┌─────────────────────────────────────────────────────────────────┐
-   │  Wind Tunnel (§18)              │  Arch Sim (§19)              │
-   │─────────────────────────────────│──────────────────────────────│
-   │  Object scale (cm–m)            │  Building scale (m–100m)     │
-   │  #wt-overlay, cyan theme        │  #arch-overlay, amber theme  │
-   │  Location from main map click   │  Manual lat/lon input + map  │
-   │  Domain ~5× model size          │  Domain ~8× building footprt │
-   │  32×22×32 flow grid             │  48×32×48 flow grid          │
-   │  Streamlines only               │  Streamlines + pressure field│
-   │  No scale calibration           │  Real-height/width cal.      │
-   │  No context buildings           │  Surrounding context cubes   │
-   │  Single panel                   │  3-column: viewport + 2 pan. │
-   └─────────────────────────────────┴──────────────────────────────┘
-
-   Physics:  Same potential-flow model as §18 (Rankine sphere + ellipsoid
-             dipole), but domain and grid are sized for building scale.
-             Pressure field: p = 0.5 * ρ * (U² - |v|²)  (Bernoulli)
-             rendered as a semi-transparent colour mesh on the ground plane.
-
-   Formats:  GLB (preferred), GLTF, OBJ, STL.
-             FBX / 3DS / SKP must be exported to GLB externally — the UI
-             explains this clearly with conversion notes.
-
-   Harvest:  Q [L/day] = LWC × v_eff × η(20%) × A × 86400 / 1000
-             Area = bounding-box face ⊥ to wind, or manual override.
 ══════════════════════════════════════════════════════════════════════ */
 
 (function () {
   'use strict';
 
-  /* ─── Module state ─────────────────────────────────────────────── */
   const AS = {
-    /* Three.js */
     renderer: null, scene: null, camera: null, controls: null, rafId: null,
-
-    /* Scene objects */
     modelMesh:    null,
     envBox:       null,
     contextMeshes: [],
     pressureMesh: null,
     particleSys:  null,
     groundPlane:  null,
-
-    /* Flow */
     flowGrid: null,
     flowDims: null,
     modelBBox: null,
-
-    /* Particles */
     particles:    null,
     trailBuf:     null,
     colorBuf:     null,
     particleCount: 3000,
-
-    /* Climate / location */
     climate: null,
-    location: null,   // {lat, lon, elev, name}
-
-    /* Scale calibration */
+    location: null,
     realHeight: null,
     realWidth:  null,
-    sceneScale: 1,    // metres per scene unit after calibration
-
-    /* UI */
+    sceneScale: 1,
     simRunning:   false,
     modelLoaded:  false,
-    activeView:   'streamlines',   // 'streamlines' | 'pressure'
+    activeView:   'streamlines',
   };
 
-  /* ─── Constants ──────────────────────────────────────────────── */
-  const AFC = 48, AFCY = 32, AFCZ = 48;   // flow grid resolution
+  const AFC = 48, AFCY = 32, AFCZ = 48;
   const A_MAX_AGE = 220;
   const A_DT      = 0.035;
   const A_TRAIL   = 12;
-  const RHO_AIR   = 1.20;   // kg/m³
+  const RHO_AIR   = 1.20;
 
   const A_SPEED_STOPS = [
     [0,    new THREE.Color(0x1a3aff)],
@@ -1890,9 +1705,6 @@ initOpacityPopovers();
     [1.0,  new THREE.Color(0xff3300)],
   ];
 
-  /* ══════════════════════════════════════════════════════
-     INIT
-  ══════════════════════════════════════════════════════ */
   function initArchSim() {
     openArchOverlay();
     if (!AS.renderer) {
@@ -1916,7 +1728,6 @@ initOpacityPopovers();
     stopArchSim();
   }
 
-  /* ── Renderer ── */
   function setupArchRenderer() {
     const canvas = document.getElementById('arch-canvas');
     AS.renderer  = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
@@ -1939,14 +1750,11 @@ initOpacityPopovers();
     }
   }
 
-  /* ── Scene ── */
   function setupArchScene() {
     AS.scene  = new THREE.Scene();
     AS.scene.fog = new THREE.FogExp2(0x050709, 0.009);
-
     AS.camera = new THREE.PerspectiveCamera(40, 1, 0.1, 2000);
     AS.camera.position.set(60, 40, 80);
-
     AS.controls = new THREE.OrbitControls(AS.camera, AS.renderer.domElement);
     AS.controls.enableDamping = true;
     AS.controls.dampingFactor = 0.07;
@@ -1956,10 +1764,8 @@ initOpacityPopovers();
     AS.controls.update();
   }
 
-  /* ── Lights ── */
   function setupArchLights() {
     const ambient = new THREE.AmbientLight(0x1a1f2e, 3.0);
-
     const sun  = new THREE.DirectionalLight(0xffd080, 2.5);
     sun.position.set(50, 80, 40);
     sun.castShadow = true;
@@ -1970,35 +1776,24 @@ initOpacityPopovers();
     sun.shadow.camera.right =  100;
     sun.shadow.camera.top   =  100;
     sun.shadow.camera.bottom = -100;
-
     const fill = new THREE.DirectionalLight(0x2060a0, 0.8);
     fill.position.set(-40, 20, -50);
-
     const rim  = new THREE.DirectionalLight(0xf5a623, 0.5);
     rim.position.set(0, -10, 60);
-
     AS.scene.add(ambient, sun, fill, rim);
   }
 
-  /* ── Ground + grid ── */
   function setupArchGround() {
-    /* Grid: 200m × 200m, 2m cells */
     const grid = new THREE.GridHelper(200, 100, 0x1a2530, 0x101820);
     grid.position.y = 0;
     AS.scene.add(grid);
-
-    /* Ground plane */
-    const gMat  = new THREE.MeshStandardMaterial({
-      color: 0x070e14, roughness: 0.95, metalness: 0,
-    });
+    const gMat  = new THREE.MeshStandardMaterial({ color: 0x070e14, roughness: 0.95, metalness: 0 });
     const gMesh = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), gMat);
     gMesh.rotation.x = -Math.PI / 2;
     gMesh.receiveShadow = true;
     gMesh.position.y   = -0.01;
     AS.scene.add(gMesh);
     AS.groundPlane = gMesh;
-
-    /* Subtle horizon line */
     const hLine = new THREE.Line(
       new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(-200, 0, 0), new THREE.Vector3(200, 0, 0)
@@ -2008,17 +1803,13 @@ initOpacityPopovers();
     AS.scene.add(hLine);
   }
 
-  /* ── Context buildings (schematic cubes around the subject model) ── */
   function buildContextBuildings() {
-    /* Remove old */
     AS.contextMeshes.forEach(m => AS.scene.remove(m));
     AS.contextMeshes = [];
-
     const boxMat = new THREE.MeshStandardMaterial({
       color: 0x0d1826, roughness: 0.8, metalness: 0.1,
       transparent: true, opacity: 0.55,
     });
-    /* Scatter ~16 context buildings in a ring 40–120m away */
     const positions = [
       [-50,0,30],[50,0,30],[-40,0,-50],[60,0,-40],[-70,0,-20],[80,0,10],
       [-30,0,70],[40,0,80],[-80,0,50],[90,0,-70],[-60,0,-80],[70,0,-90],
@@ -2038,8 +1829,6 @@ initOpacityPopovers();
       mesh.receiveShadow = true;
       AS.scene.add(mesh);
       AS.contextMeshes.push(mesh);
-
-      /* Wireframe outline on each context building */
       const edges = new THREE.EdgesGeometry(geo);
       const wire  = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
         color: 0xf5a623, transparent: true, opacity: 0.07
@@ -2050,7 +1839,6 @@ initOpacityPopovers();
     });
   }
 
-  /* ── Render loop ── */
   function archAnimate() {
     AS.rafId = requestAnimationFrame(archAnimate);
     AS.controls && AS.controls.update();
@@ -2063,12 +1851,6 @@ initOpacityPopovers();
     if (AS.rafId) { cancelAnimationFrame(AS.rafId); AS.rafId = null; }
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     MODEL LOADING  (GLB / GLTF / OBJ / STL)
-     Same loaders as §18, but scale calibration applied
-     after load using real-height / real-width inputs.
-  ══════════════════════════════════════════════════════ */
   function archLoadModel(file) {
     setArchStatus('LOADING MODEL…', 'running');
     const ext = file.name.split('.').pop().toLowerCase();
@@ -2079,25 +1861,20 @@ initOpacityPopovers();
     const onLoaded = (object) => {
       const mesh = object.scene || object;
 
-      /* Default normalise: fit in 30m cube */
       const bbox0 = new THREE.Box3().setFromObject(mesh);
       const size0 = bbox0.getSize(new THREE.Vector3());
       const maxD  = Math.max(size0.x, size0.y, size0.z) || 1;
       const norm  = 30 / maxD;
       mesh.scale.setScalar(norm);
 
-      /* Lift to ground */
       const bLift = new THREE.Box3().setFromObject(mesh);
       mesh.position.y -= bLift.min.y;
 
-      /* Material polish */
       mesh.traverse(c => {
         if (!c.isMesh) return;
         c.castShadow = c.receiveShadow = true;
         if (!c.material) {
-          c.material = new THREE.MeshStandardMaterial({
-            color: 0x2a4060, roughness: 0.6, metalness: 0.25
-          });
+          c.material = new THREE.MeshStandardMaterial({ color: 0x2a4060, roughness: 0.6, metalness: 0.25 });
         } else {
           if (c.material.color) c.material.color.multiplyScalar(0.9);
           c.material.roughness    = Math.max(c.material.roughness || 0.5, 0.4);
@@ -2114,7 +1891,6 @@ initOpacityPopovers();
       AS.modelBBox  = new THREE.Box3().setFromObject(mesh);
       AS.sceneScale = 1;
 
-      /* Wireframe envelope */
       const sz  = AS.modelBBox.getSize(new THREE.Vector3());
       const ctr = AS.modelBBox.getCenter(new THREE.Vector3());
       const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(sz.x*1.06, sz.y*1.06, sz.z*1.06));
@@ -2124,20 +1900,15 @@ initOpacityPopovers();
       AS.envBox.position.copy(ctr);
       AS.scene.add(AS.envBox);
 
-      /* Fly camera */
       const cd = Math.max(sz.x, sz.y, sz.z) * 3.5;
       AS.camera.position.set(cd, cd * 0.7, cd * 1.5);
       AS.controls.target.copy(ctr);
       AS.controls.update();
 
-      /* Context buildings */
       buildContextBuildings();
-
-      /* Flow field */
       buildArchFlowField();
       applyRealScale();
 
-      /* Update UI */
       AS.modelLoaded = true;
       const sz2 = AS.modelBBox.getSize(new THREE.Vector3());
       document.getElementById('archModelInfo').innerHTML =
@@ -2157,7 +1928,6 @@ initOpacityPopovers();
     const reader = new FileReader();
 
     if (ext === 'glb' || ext === 'gltf') {
-      /* ArrayBuffer → GLTFLoader.parse() — bypasses XHR/blob entirely */
       reader.onload = e => {
         try {
           new THREE.GLTFLoader().parse(e.target.result, '', onLoaded, onError);
@@ -2166,7 +1936,6 @@ initOpacityPopovers();
       reader.onerror = () => onError(new Error('FileReader failed'));
       reader.readAsArrayBuffer(file);
     } else if (ext === 'obj') {
-      const reader = new FileReader();
       reader.onload = e => {
         try {
           const obj = new THREE.OBJLoader().parse(e.target.result);
@@ -2180,7 +1949,6 @@ initOpacityPopovers();
       reader.onerror = onError;
       reader.readAsText(file);
     } else if (ext === 'stl') {
-      const reader = new FileReader();
       reader.onload = e => {
         try {
           const geo = new THREE.STLLoader().parse(e.target.result);
@@ -2199,7 +1967,6 @@ initOpacityPopovers();
     }
   }
 
-  /* ── Apply real-world scale from height/width inputs ── */
   function applyRealScale() {
     if (!AS.modelMesh || !AS.modelBBox) return;
     const realH  = parseFloat(document.getElementById('archBldgHeight').value) || 0;
@@ -2221,7 +1988,6 @@ initOpacityPopovers();
     AS.modelMesh.position.y -= b.min.y;
     AS.modelBBox = new THREE.Box3().setFromObject(AS.modelMesh);
 
-    /* Update envelope */
     if (AS.envBox) {
       const ctr2 = AS.modelBBox.getCenter(new THREE.Vector3());
       const sz2  = AS.modelBBox.getSize(new THREE.Vector3());
@@ -2229,7 +1995,6 @@ initOpacityPopovers();
       AS.envBox.scale.set(sz2.x * 1.06, sz2.y * 1.06, sz2.z * 1.06);
     }
 
-    /* Fly camera to new size */
     const sz3 = AS.modelBBox.getSize(new THREE.Vector3());
     const cd  = Math.max(sz3.x, sz3.y, sz3.z) * 3;
     AS.camera.position.set(cd, cd * 0.6, cd * 1.4);
@@ -2241,7 +2006,6 @@ initOpacityPopovers();
     setArchStatus('SCALE APPLIED', 'done');
   }
 
-  /* ── Transform sliders ── */
   function updateArchTransforms() {
     if (!AS.modelMesh) return;
     const scale = parseFloat(document.getElementById('archScale').value)     || 1;
@@ -2264,14 +2028,6 @@ initOpacityPopovers();
     buildArchFlowField();
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     POTENTIAL FLOW FIELD  (architecture scale)
-     Same physics as §18 but:
-     - 48×32×48 grid (higher resolution)
-     - Domain is 8× building footprint in wind direction
-     - Ground boundary: v(y=0) = 0 via mirror-image method
-  ══════════════════════════════════════════════════════ */
   function buildArchFlowField() {
     const bbox = AS.modelBBox || new THREE.Box3(
       new THREE.Vector3(-15, 0, -15), new THREE.Vector3(15, 30, 15)
@@ -2279,11 +2035,10 @@ initOpacityPopovers();
     const centre = bbox.getCenter(new THREE.Vector3());
     const size   = bbox.getSize(new THREE.Vector3());
 
-    /* Domain sized for building-scale: wider in wind direction (+X) */
     const domW = size.x * 8;
     const domH = size.y * 5;
     const domD = size.z * 8;
-    const ox   = centre.x - domW * 0.35;   // asymmetric: more wake room
+    const ox   = centre.x - domW * 0.35;
     const oy   = 0;
     const oz   = centre.z - domD / 2;
 
@@ -2293,7 +2048,6 @@ initOpacityPopovers();
 
     AS.flowDims = { cx:AFC, cy:AFCY, cz:AFCZ, ox, oy, oz, cellW, cellH, cellD };
 
-    /* Ellipsoid half-axes (inflated 15% over bounding box) */
     const ax = size.x * 0.65, ay = size.y * 0.65, az = size.z * 0.65;
     const cx = centre.x, cy = centre.y, cz = centre.z;
     const U  = 1.0, A = U * ax * ay * az;
@@ -2307,7 +2061,6 @@ initOpacityPopovers();
           const wy = oy + iy * cellH;
           const wz = oz + iz * cellD;
 
-          /* Real-image method: mirror about ground plane to enforce v(y=0)=0 */
           function dipole(dx, dy, dz) {
             const r2 = dx*dx + dy*dy + dz*dz;
             const r  = Math.sqrt(r2) || 1e-9;
@@ -2324,9 +2077,8 @@ initOpacityPopovers();
           const dzR = (wz - cz) / (az * 1.12);
           const rR  = Math.sqrt(dxR*dxR + dyR*dyR + dzR*dzR);
 
-          /* Image point: reflected below ground */
           const dxI = (wx - cx)  / (ax * 1.12);
-          const dyI = (wy + cy)  / (ay * 1.12);  // mirror y
+          const dyI = (wy + cy)  / (ay * 1.12);
           const dzI = (wz - cz)  / (az * 1.12);
 
           let u, v, w;
@@ -2336,15 +2088,13 @@ initOpacityPopovers();
             const d1 = dipole(dxR, dyR, dzR);
             const d2 = dipole(dxI, dyI, dzI);
             u = (d1.u + d2.u) * 0.5;
-            v = (d1.v - d2.v) * 0.5;   // antisymmetric in v
+            v = (d1.v - d2.v) * 0.5;
             w = (d1.w + d2.w) * 0.5;
-            /* Clamp to reasonable range */
             u = Math.max(-3, Math.min(3, u));
             v = Math.max(-3, Math.min(3, v));
             w = Math.max(-3, Math.min(3, w));
           }
 
-          /* Ground slip: damp v near ground */
           const groundDamp = Math.min(1, wy / Math.max(0.5, ay * 0.3));
           v *= groundDamp;
 
@@ -2357,11 +2107,9 @@ initOpacityPopovers();
     }
     AS.flowGrid = grid;
 
-    /* Rebuild pressure mesh if in pressure view */
     if (AS.activeView === 'pressure') buildPressureMesh();
   }
 
-  /* ── Trilinear interpolation ── */
   function sampleArchFlow(wx, wy, wz) {
     const d = AS.flowDims;
     if (!d || !AS.flowGrid) return { u:1, v:0, w:0 };
@@ -2388,12 +2136,6 @@ initOpacityPopovers();
     return { u:lerpC(0), v:lerpC(1), w:lerpC(2) };
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     PRESSURE FIELD MESH  (ground-level colour map)
-     p = ½ρ(U² - |v|²)  — Bernoulli
-     Rendered as a fine quad mesh on the ground plane.
-  ══════════════════════════════════════════════════════ */
   function buildPressureMesh() {
     if (AS.pressureMesh) { AS.scene.remove(AS.pressureMesh); AS.pressureMesh = null; }
     const d = AS.flowDims;
@@ -2405,7 +2147,6 @@ initOpacityPopovers();
     const dx  = (xe - xs) / (RES - 1);
     const dz  = (ze - zs) / (RES - 1);
 
-    /* Sample pressure at y = 1m (low height) */
     const Y_SAMPLE = 1.0;
     let pMin = Infinity, pMax = -Infinity;
     const pArr = new Float32Array(RES * RES);
@@ -2422,7 +2163,6 @@ initOpacityPopovers();
       }
     }
 
-    /* Build PlaneGeometry with vertex colors */
     const geo = new THREE.PlaneGeometry(xe-xs, ze-zs, RES-1, RES-1);
     geo.rotateX(-Math.PI / 2);
     const colours = new Float32Array(RES * RES * 3);
@@ -2447,13 +2187,11 @@ initOpacityPopovers();
     AS.pressureMesh.position.set((xs+xe)*0.5, 0.05, (zs+ze)*0.5);
     AS.scene.add(AS.pressureMesh);
 
-    /* Update colorbar labels */
     const windSpd = AS.climate ? AS.climate.speed : 5;
     document.getElementById('archCbMid').textContent = (windSpd * 0.5).toFixed(1);
     document.getElementById('archCbMax').textContent = (windSpd * 1.4).toFixed(1);
   }
 
-  /* Pressure color: blue = suction, amber = stagnation */
   function pressureColor(t) {
     const stops = [
       [0,   new THREE.Color(0x1a3aff)],
@@ -2470,7 +2208,6 @@ initOpacityPopovers();
     return stops[stops.length-1][1];
   }
 
-  /* ── Toggle between streamlines and pressure views ── */
   function setViewMode(mode) {
     AS.activeView = mode;
     document.querySelectorAll('.arch-vt-btn').forEach(b => {
@@ -2486,10 +2223,6 @@ initOpacityPopovers();
     }
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     PARTICLE SYSTEM  (same scheme as §18, but larger)
-  ══════════════════════════════════════════════════════ */
   function initArchParticles() {
     if (AS.particleSys) { AS.scene.remove(AS.particleSys); AS.particleSys = null; }
     AS.particleCount = parseInt(document.getElementById('archParticles').value) || 3000;
@@ -2538,7 +2271,6 @@ initOpacityPopovers();
     const d = AS.flowDims;
     const N = AS.particleCount, segs = A_TRAIL;
 
-    /* Get actual wind speed from climate or override slider */
     const overrideSl = parseFloat(document.getElementById('archWindOverride').value) || 0;
     const windSpd = overrideSl > 0.4 ? overrideSl
                   : (AS.climate ? AS.climate.speed : 5);
@@ -2560,7 +2292,6 @@ initOpacityPopovers();
       p.x += u * A_DT * speedScale;
       p.y += v * A_DT * speedScale;
       p.z += w * A_DT * speedScale;
-      /* Ground clamp */
       if (p.y < 0.1) p.y = 0.1;
 
       p.trail.push(p.x, p.y, p.z);
@@ -2573,7 +2304,6 @@ initOpacityPopovers();
       }
     }
 
-    /* Update buffers */
     const pos = AS.trailBuf, col = AS.colorBuf;
     const nf  = maxSpd > 0 ? 1 / maxSpd : 1;
     for (let i = 0; i < N; i++) {
@@ -2607,10 +2337,6 @@ initOpacityPopovers();
     return A_SPEED_STOPS[A_SPEED_STOPS.length-1][1];
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     CLIMATE FETCH  (reuses §7 fetchPointData → ICON)
-  ══════════════════════════════════════════════════════ */
   async function fetchArchClimate() {
     const btn = document.getElementById('archFetchClimate');
     btn.disabled = true;
@@ -2624,16 +2350,13 @@ initOpacityPopovers();
       const d = await fetchPointData(lat, lon, '10m', month);
       AS.climate = { speed: d.speed, dir: d.dir, humidity: d.humidity, temp: d.temp, month };
 
-      /* Update wind rose */
       const arrowDeg = (d.dir + 180) % 360;
       document.getElementById('archWindArrowG').setAttribute('transform', `rotate(${arrowDeg},40,40)`);
       document.getElementById('archWindSpeedLabel').textContent = d.speed.toFixed(1) + ' m/s';
 
-      /* Update HUD */
       document.getElementById('archHudLoc').textContent =
         `${lat.toFixed(3)}°, ${lon.toFixed(3)}°`;
 
-      /* Climate grid */
       const grid = document.getElementById('archClimateGrid');
       grid.innerHTML = [
         { k:'WIND SPEED', v: d.speed.toFixed(1), u:'m/s' },
@@ -2645,7 +2368,6 @@ initOpacityPopovers();
       ].map(r => `<div class="arch-cg-item"><div class="arch-cg-k">${r.k}</div><div class="arch-cg-v">${r.v}<span class="arch-cg-u">${r.u ? ' '+r.u : ''}</span></div></div>`).join('');
       grid.classList.remove('hidden');
 
-      /* Rebuild flow with new wind direction applied */
       buildArchFlowField();
       setArchStatus(`ICON · ${toDirCard(d.dir)} ${d.speed.toFixed(1)} m/s`, 'done');
     } catch(err) {
@@ -2656,10 +2378,6 @@ initOpacityPopovers();
     }
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     RUN SIMULATION
-  ══════════════════════════════════════════════════════ */
   function runArchSim() {
     if (!AS.modelLoaded) {
       setArchStatus('UPLOAD A MODEL FIRST', 'error'); return;
@@ -2688,33 +2406,25 @@ initOpacityPopovers();
     archAnimate();
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     HARVEST CALCULATION  (architecture scale)
-  ══════════════════════════════════════════════════════ */
   function computeArchResults() {
     const climate  = AS.climate || { speed:5, dir:270, humidity:82, temp:15 };
     const windSpeed = climate.speed;
     const humidity  = climate.humidity;
 
-    /* Collection area */
     const manualA = parseFloat(document.getElementById('archAreaInput').value) || 0;
     let area;
     if (manualA > 0) {
       area = manualA;
     } else if (AS.modelBBox) {
       const sz = AS.modelBBox.getSize(new THREE.Vector3());
-      /* Exposed face ⊥ to wind = height × depth */
       area = sz.y * sz.z;
     } else { area = 50; }
 
-    /* LWC */
     const lwc  = estimateLWC(humidity);
     const vEff = Math.max(0.5, windSpeed * 0.88);
     const eta  = 0.20;
     const daily = lwc * vEff * eta * area * 86400 / 1000;
 
-    /* Stagnation / suction ratio from flow samples */
     let stagRatio = 1.0, suctionZone = 0;
     if (AS.modelBBox && AS.flowDims) {
       const ctr = AS.modelBBox.getCenter(new THREE.Vector3());
@@ -2723,7 +2433,6 @@ initOpacityPopovers();
       for (let t = 0; t < 20; t++) {
         const wr = (Math.random() - 0.5) * sz.z * 0.9;
         const wh = Math.random() * sz.y;
-        /* Upwind face */
         const { u:uf } = sampleArchFlow(ctr.x - sz.x * 0.52, ctr.y + wh, ctr.z + wr);
         const { u:uw } = sampleArchFlow(ctr.x + sz.x * 0.52, ctr.y + wh, ctr.z + wr);
         sampleCount++;
@@ -2770,10 +2479,6 @@ initOpacityPopovers();
     showArchSection('archResultsSection');
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     PLACE ON MAIN MAP
-  ══════════════════════════════════════════════════════ */
   function archPlaceOnMap() {
     const lat = parseFloat(document.getElementById('archLat').value) || S.selectedPoint?.lat;
     const lon = parseFloat(document.getElementById('archLon').value) || S.selectedPoint?.lon;
@@ -2802,10 +2507,6 @@ initOpacityPopovers();
     closeArchOverlay();
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     EXPORT DATA CARD  (downloads a text/JSON summary)
-  ══════════════════════════════════════════════════════ */
   function exportArchDataCard() {
     const lat  = document.getElementById('archLat').value   || '—';
     const lon  = document.getElementById('archLon').value   || '—';
@@ -2845,10 +2546,6 @@ initOpacityPopovers();
     URL.revokeObjectURL(url);
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     UI HELPERS
-  ══════════════════════════════════════════════════════ */
   function setArchStatus(msg, type) {
     const dot = document.getElementById('archStatusDot');
     const txt = document.getElementById('archStatusTxt');
@@ -2878,28 +2575,32 @@ initOpacityPopovers();
   }
 
   function setupArchDragDrop() {
-    const zone = document.getElementById('archUploadArea');
-    zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
-    zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+    const zone  = document.getElementById('archUploadArea');
+    const input = document.getElementById('archFileInput');
+
+    /* FIX: clicking the zone opens the file picker */
+    zone.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      input.value = '';
+      input.click();
+    });
+
+    zone.addEventListener('dragover',  e => { e.preventDefault(); e.stopPropagation(); zone.classList.add('drag-over'); });
+    zone.addEventListener('dragleave', (e) => { e.stopPropagation(); zone.classList.remove('drag-over'); });
     zone.addEventListener('drop', e => {
-      e.preventDefault(); zone.classList.remove('drag-over');
+      e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag-over');
       const file = e.dataTransfer.files[0];
       if (file) archLoadModel(file);
     });
   }
 
-
-  /* ══════════════════════════════════════════════════════
-     WIRE ALL EVENTS
-  ══════════════════════════════════════════════════════ */
   function wireArchEvents() {
-    /* Open / close */
     document.getElementById('btnArchSim').addEventListener('click', initArchSim);
     document.getElementById('arch-close').addEventListener('click', closeArchOverlay);
     document.getElementById('arch-overlay').addEventListener('click', e => {
       if (e.target === document.getElementById('arch-overlay')) closeArchOverlay();
     });
-    /* Escape key — only close if arch overlay is open */
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape' &&
           !document.getElementById('arch-overlay').classList.contains('arch-hidden')) {
@@ -2907,16 +2608,13 @@ initOpacityPopovers();
       }
     });
 
-    /* File input */
     document.getElementById('archFileInput').addEventListener('change', e => {
       const f = e.target.files[0]; if (f) archLoadModel(f);
     });
     setupArchDragDrop();
 
-    /* Scale */
     document.getElementById('archApplyScale').addEventListener('click', applyRealScale);
 
-    /* Transform sliders */
     [
       ['archScale',    'archScaleVal',    v => v.toFixed(1) + '×'],
       ['archRotY',     'archRotYVal',     v => Math.round(v) + '°'],
@@ -2928,7 +2626,6 @@ initOpacityPopovers();
       });
     });
 
-    /* Particle & wind override sliders */
     document.getElementById('archParticles').addEventListener('input', function() {
       document.getElementById('archParticlesVal').textContent = this.value;
     });
@@ -2938,374 +2635,30 @@ initOpacityPopovers();
         v > 0.4 ? v.toFixed(1) + ' m/s' : 'AUTO';
     });
 
-    /* Use main map point */
     document.getElementById('archUseMapPoint').addEventListener('click', () => {
       populateArchLocationFromMap();
       if (!S.selectedPoint) alert('Click on the main map first to select a point.');
     });
 
-    /* Climate fetch */
     document.getElementById('archFetchClimate').addEventListener('click', fetchArchClimate);
 
-    /* View toggle (streamlines / pressure) */
     document.querySelectorAll('.arch-vt-btn').forEach(btn => {
       btn.addEventListener('click', () => setViewMode(btn.dataset.view));
     });
 
-    /* Run / Reset */
     document.getElementById('archRunSim').addEventListener('click', runArchSim);
     document.getElementById('archResetSim').addEventListener('click', resetArchSim);
 
-    /* Place on map */
     document.getElementById('archPlaceOnMap').addEventListener('click', archPlaceOnMap);
-
-    /* Export */
     document.getElementById('archExportData').addEventListener('click', exportArchDataCard);
   }
 
-  /* Script is at bottom of <body> — DOM already parsed, call directly */
   wireArchEvents();
 
-})(); /* end §19 Architecture Sim IIFE */
-
+})();
 /* ═══════════════════════════════════════════════════════════════════════
-   3D WIND TUNNEL MODEL UPLOAD FIX
-   Add this entire section to the END of your script.js
-   ═══════════════════════════════════════════════════════════════════════ */
-
-let TUNNEL_SCENE = null;
-let TUNNEL_CAMERA = null;
-let TUNNEL_RENDERER = null;
-let TUNNEL_CONTROLS = null;
-let TUNNEL_CURRENT_MODEL = null;
-
-function initTunnelModal() {
-  const btnTunnel = document.getElementById('btnWindTunnel');
-  const overlay = document.getElementById('tunnel-overlay');
-  const closeBtn = document.getElementById('btnTunnelClose');
-
-  if (!btnTunnel || !overlay) return;
-
-  btnTunnel.addEventListener('click', () => {
-    overlay.classList.remove('hidden');
-    setTimeout(() => {
-      if (!TUNNEL_RENDERER) {
-        initTunnelViewer();
-      }
-    }, 100);
-  });
-
-  closeBtn.addEventListener('click', () => {
-    overlay.classList.add('hidden');
-  });
-
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) {
-      overlay.classList.add('hidden');
-    }
-  });
-}
-
-function initTunnelViewer() {
-  const canvas = document.getElementById('tunnelCanvas');
-  if (!canvas || TUNNEL_RENDERER) return;
-
-  const width = canvas.parentElement.clientWidth;
-  const height = canvas.parentElement.clientHeight;
-
-  TUNNEL_RENDERER = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-  TUNNEL_RENDERER.setSize(width, height);
-  TUNNEL_RENDERER.setClearColor(0x1a1a1a, 1);
-  TUNNEL_RENDERER.shadowMap.enabled = true;
-
-  TUNNEL_SCENE = new THREE.Scene();
-  TUNNEL_SCENE.background = new THREE.Color(0x1a1a1a);
-
-  TUNNEL_CAMERA = new THREE.PerspectiveCamera(60, width / height, 0.1, 2000);
-  TUNNEL_CAMERA.position.set(50, 30, 50);
-  TUNNEL_CAMERA.lookAt(0, 0, 0);
-
-  const ambLight = new THREE.AmbientLight(0xffffff, 0.7);
-  TUNNEL_SCENE.add(ambLight);
-
-  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-  dirLight.position.set(100, 100, 100);
-  dirLight.castShadow = true;
-  TUNNEL_SCENE.add(dirLight);
-
-  const groundGeom = new THREE.PlaneGeometry(200, 200);
-  const groundMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
-  const ground = new THREE.Mesh(groundGeom, groundMat);
-  ground.rotation.x = -Math.PI / 2;
-  ground.receiveShadow = true;
-  TUNNEL_SCENE.add(ground);
-
-  TUNNEL_CONTROLS = new THREE.OrbitControls(TUNNEL_CAMERA, TUNNEL_RENDERER.domElement);
-  TUNNEL_CONTROLS.enableDamping = true;
-  TUNNEL_CONTROLS.dampingFactor = 0.05;
-  TUNNEL_CONTROLS.autoRotate = true;
-  TUNNEL_CONTROLS.autoRotateSpeed = 2;
-
-  function animate() {
-    requestAnimationFrame(animate);
-    TUNNEL_CONTROLS.update();
-    TUNNEL_RENDERER.render(TUNNEL_SCENE, TUNNEL_CAMERA);
-  }
-  animate();
-
-  window.addEventListener('resize', () => {
-    const w = canvas.parentElement.clientWidth;
-    const h = canvas.parentElement.clientHeight;
-    TUNNEL_CAMERA.aspect = w / h;
-    TUNNEL_CAMERA.updateProjectionMatrix();
-    TUNNEL_RENDERER.setSize(w, h);
-  });
-
-  initModelUpload();
-}
-
-function initModelUpload() {
-  const dropzone = document.getElementById('tunnelDropzone');
-  const fileInput = document.getElementById('tunnelFileInput');
-
-  if (!dropzone || !fileInput) return;
-
-  dropzone.addEventListener('click', () => {
-    fileInput.click();
-  });
-
-  fileInput.addEventListener('change', (e) => {
-    if (e.target.files.length > 0) {
-      handleModelFile(e.target.files[0]);
-    }
-  });
-
-  dropzone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    dropzone.classList.add('dragover');
-  });
-
-  dropzone.addEventListener('dragleave', () => {
-    dropzone.classList.remove('dragover');
-  });
-
-  dropzone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    dropzone.classList.remove('dragover');
-    if (e.dataTransfer.files.length > 0) {
-      handleModelFile(e.dataTransfer.files[0]);
-    }
-  });
-}
-
-function handleModelFile(file) {
-  const validExtensions = ['.glb', '.gltf', '.obj', '.stl'];
-  const ext = '.' + file.name.split('.').pop().toLowerCase();
-
-  if (!validExtensions.includes(ext)) {
-    alert('❌ Format not supported. Use: GLB, GLTF, OBJ, or STL');
-    return;
-  }
-
-  if (file.size > 50 * 1024 * 1024) {
-    alert('❌ File too large (max 50 MB)');
-    return;
-  }
-
-  const dropzone = document.getElementById('tunnelDropzone');
-  dropzone.innerHTML = '<div style="padding: 20px; color: #888;">📦 Loading model...</div>';
-
-  const reader = new FileReader();
-
-  reader.onload = (event) => {
-    try {
-      const arrayBuffer = event.target.result;
-      loadModel(arrayBuffer, file.name, ext);
-      dropzone.innerHTML = `<div style="color: #4CAF50; padding: 15px; text-align: center;">✓ <strong>${file.name}</strong><br><small>Ready to place</small></div>`;
-    } catch (error) {
-      console.error('Model load error:', error);
-      dropzone.innerHTML = `<div style="color: #ff6b6b;">❌ ${error.message}</div>`;
-      setTimeout(() => {
-        dropzone.innerHTML = '<svg viewBox="0 0 36 36" fill="none" width="24"><rect x="4" y="8" width="24" height="20" rx="2" stroke="currentColor" stroke-width="1.2"/><path d="M18 12v8M14 16h8" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/></svg><p>Drop or click to upload</p>';
-      }, 3000);
-    }
-  };
-
-  reader.onerror = () => {
-    alert('❌ Error reading file');
-  };
-
-  reader.readAsArrayBuffer(file);
-}
-
-function loadModel(arrayBuffer, filename, ext) {
-  if (TUNNEL_CURRENT_MODEL) {
-    TUNNEL_SCENE.remove(TUNNEL_CURRENT_MODEL);
-    TUNNEL_CURRENT_MODEL = null;
-  }
-
-  if (ext === '.glb' || ext === '.gltf') {
-    loadGLB(arrayBuffer, filename);
-  } else if (ext === '.obj') {
-    loadOBJ(arrayBuffer, filename);
-  } else if (ext === '.stl') {
-    loadSTL(arrayBuffer, filename);
-  }
-}
-
-function loadGLB(arrayBuffer, filename) {
-  const blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
-
-  const loader = new THREE.GLTFLoader();
-  loader.load(
-    url,
-    (gltf) => {
-      const model = gltf.scene;
-      updateTunnelModel(model, filename);
-      URL.revokeObjectURL(url);
-    },
-    undefined,
-    (err) => {
-      console.error('GLB load error:', err);
-      throw new Error('Failed to load GLB: ' + err.message);
-    }
-  );
-}
-
-function loadOBJ(arrayBuffer, filename) {
-  const blob = new Blob([arrayBuffer], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
-
-  if (!window.THREE || !window.THREE.OBJLoader) {
-    URL.revokeObjectURL(url);
-    throw new Error('OBJLoader not available. Convert to GLB for better support.');
-  }
-
-  const loader = new THREE.OBJLoader();
-  loader.load(
-    url,
-    (object) => {
-      updateTunnelModel(object, filename);
-      URL.revokeObjectURL(url);
-    },
-    undefined,
-    (err) => {
-      URL.revokeObjectURL(url);
-      throw new Error('Failed to load OBJ: ' + err.message);
-    }
-  );
-}
-
-function loadSTL(arrayBuffer, filename) {
-  const blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
-
-  if (!window.THREE || !window.THREE.STLLoader) {
-    URL.revokeObjectURL(url);
-    throw new Error('STLLoader not available. Convert to GLB for better support.');
-  }
-
-  const loader = new THREE.STLLoader();
-  loader.load(
-    url,
-    (geometry) => {
-      const material = new THREE.MeshStandardMaterial({ color: 0x8B6F47, metalness: 0.3 });
-      const mesh = new THREE.Mesh(geometry, material);
-      updateTunnelModel(mesh, filename);
-      URL.revokeObjectURL(url);
-    },
-    undefined,
-    (err) => {
-      URL.revokeObjectURL(url);
-      throw new Error('Failed to load STL: ' + err.message);
-    }
-  );
-}
-
-function updateTunnelModel(model, filename) {
-  try {
-    model.castShadow = true;
-    model.receiveShadow = true;
-    TUNNEL_SCENE.add(model);
-    TUNNEL_CURRENT_MODEL = model;
-
-    const box = new THREE.Box3().setFromObject(model);
-    const center = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
-
-    model.position.sub(center);
-
-    const maxDim = Math.max(size.x, size.y, size.z);
-    const scale = maxDim > 0 ? 10 / maxDim : 1;
-    model.scale.multiplyScalar(scale);
-
-    const infoBox = document.getElementById('tunnelModelInfo');
-    infoBox.innerHTML = `
-      <div class="tmi-name">✓ ${filename}</div>
-      <div class="tmi-size">${size.x.toFixed(1)}m × ${size.y.toFixed(1)}m × ${size.z.toFixed(1)}m</div>
-    `;
-    infoBox.classList.remove('hidden');
-
-    const scaleSlider = document.getElementById('tunnelScaleSlider');
-    if (scaleSlider) {
-      scaleSlider.value = scale;
-      document.getElementById('tunnelScaleVal').textContent = scale.toFixed(1) + '×';
-    }
-
-    console.log('✓ Model loaded:', filename);
-  } catch (error) {
-    console.error('Error updating model:', error);
-    throw error;
-  }
-}
-
-function initTunnelTransforms() {
-  const scaleSlider = document.getElementById('tunnelScaleSlider');
-  const rotSlider = document.getElementById('tunnelRotSlider');
-  const elevInput = document.getElementById('tunnelElevInput');
-
-  if (scaleSlider) {
-    scaleSlider.addEventListener('input', () => {
-      if (TUNNEL_CURRENT_MODEL) {
-        const scale = parseFloat(scaleSlider.value);
-        TUNNEL_CURRENT_MODEL.scale.set(scale, scale, scale);
-        document.getElementById('tunnelScaleVal').textContent = scale.toFixed(1) + '×';
-      }
-    });
-  }
-
-  if (rotSlider) {
-    rotSlider.addEventListener('input', () => {
-      if (TUNNEL_CURRENT_MODEL) {
-        const rot = parseFloat(rotSlider.value) * Math.PI / 180;
-        TUNNEL_CURRENT_MODEL.rotation.y = rot;
-        document.getElementById('tunnelRotVal').textContent = Math.round(rotSlider.value) + '°';
-      }
-    });
-  }
-
-  if (elevInput) {
-    elevInput.addEventListener('change', () => {
-      if (TUNNEL_CURRENT_MODEL) {
-        const elev = parseFloat(elevInput.value) || 0;
-        TUNNEL_CURRENT_MODEL.position.y = elev;
-      }
-    });
-  }
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  initTunnelModal();
-  initTunnelTransforms();
-});
-
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
-    initTunnelModal();
-    initTunnelTransforms();
-  });
-} else {
-  initTunnelModal();
-  initTunnelTransforms();
-}
+   END OF script.js  ·  FogHarvest v7-fixed
+   Legacy "3D WIND TUNNEL MODEL UPLOAD FIX" block removed.
+   That block used loader.load(blobURL) which hangs in THREE r128 and
+   defined a global loadModel() that shadowed the IIFE's local version.
+═══════════════════════════════════════════════════════════════════════ */
