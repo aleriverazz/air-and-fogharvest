@@ -73,10 +73,10 @@ const CFG = {
 
   WIND: {
     PARTICLE_COUNT: 2200,
-    FADE:       0.94,
-    SPEED_SCALE: 0.38,
+    FADE:       0.96,
+    SPEED_SCALE: 0.13,
     LINE_WIDTH:  1.8,
-    MAX_AGE:     100,
+    MAX_AGE:     160,
     MAX_ALPHA:   0.82,
     MIN_ALPHA:   0.32,
   },
@@ -440,7 +440,7 @@ function buildUVGrid(samples, sw, ne, cols, rows) {
     /* FIX: u = east component (sin), v = north component (cos).
        Both stored POSITIVE. The particle loop handles the canvas-Y
        inversion by doing p.y -= v (see §7). */
-    uv[idx]   =  speed * Math.sin(rad);   // u: east  → +canvas-X
+    uv[idx]   = -speed * Math.sin(rad);   // u: east+ for westerly(270°): -sin(270)=+1 ✓
     uv[idx+1] =  speed * Math.cos(rad);   // v: north → stored +, subtracted in loop
   }
   return uv;
@@ -509,7 +509,7 @@ function startWindParticles(){
       const scale=CFG.WIND.SPEED_SCALE*(W/600);
       p.px=p.x; p.py=p.y;
       p.x += u * scale;   // east  → moves right on canvas ✓
-      p.y -= v * scale;   // north → moves UP on canvas (Y inverted) ✓
+      p.y += v * scale;   // south → +Y = down; cos(0°)=+1 for N-wind blows S ✓
       p.age++;
       if(p.x<0||p.x>W||p.y<0||p.y>H||p.age>CFG.WIND.MAX_AGE){ resetParticle(p,W,H); continue; }
       const base=Math.min(CFG.WIND.MAX_ALPHA,CFG.WIND.MIN_ALPHA+(speed/15)*(CFG.WIND.MAX_ALPHA-CFG.WIND.MIN_ALPHA));
@@ -988,13 +988,14 @@ initOpacityPopovers();
   }
 
   function setupLights() {
-    const ambient = new THREE.AmbientLight(0x1a2030, 2.5);
-    const key     = new THREE.DirectionalLight(0x8ad4ff, 2.2);
+    /* FIX: boosted ambient and key so model is visible against dark bg */
+    const ambient = new THREE.AmbientLight(0x4060a0, 4.5);   // brighter, bluer
+    const key     = new THREE.DirectionalLight(0xc8e8ff, 3.8); // strong key
     key.position.set(5, 10, 8);
     key.castShadow = true;
-    const fill    = new THREE.DirectionalLight(0x00ffaa, 0.6);
+    const fill    = new THREE.DirectionalLight(0x00ffcc, 1.4); // stronger fill
     fill.position.set(-8, 4, -6);
-    const rim     = new THREE.DirectionalLight(0x00c8ff, 1.0);
+    const rim     = new THREE.DirectionalLight(0x00d4ff, 2.2); // stronger rim
     rim.position.set(0, -3, 10);
     WT.scene.add(ambient, key, fill, rim);
     WT.lights = [ambient, key, fill, rim];
@@ -1051,15 +1052,19 @@ initOpacityPopovers();
       mesh.traverse(c => {
         if (!c.isMesh) return;
         c.castShadow = c.receiveShadow = true;
-        if (!c.material) {
-          c.material = new THREE.MeshStandardMaterial({ color: 0x2a6080, roughness: 0.55, metalness: 0.3, transparent: true, opacity: 0.85 });
-        } else {
-          c.material.transparent = true;
-          c.material.opacity = Math.min(c.material.opacity != null ? c.material.opacity : 1, 0.88);
-          if (!c.material.emissive) c.material.emissive = new THREE.Color(0x001428);
-          else c.material.emissive.set(0x001428);
-          c.material.emissiveIntensity = 0.25;
-        }
+        /* FIX: model was invisible — dark color + low emissive against dark bg.
+           Now: opaque white-grey surface with strong cyan emissive so it
+           reads clearly against both the black scene and the particle trails. */
+        const matNew = new THREE.MeshStandardMaterial({
+          color:             0xc8e8f0,   // light cyan-white — visible against dark bg
+          roughness:         0.35,
+          metalness:         0.55,
+          emissive:          new THREE.Color(0x004466),
+          emissiveIntensity: 0.8,        // strong glow so model reads through particles
+          transparent:       false,      // opaque — particles use additive so model shows through anyway
+        });
+        c.material = matNew;
+        c.material.needsUpdate = true;
       });
 
       WT.scene.add(mesh);
@@ -1112,7 +1117,7 @@ initOpacityPopovers();
           const obj = new THREE.OBJLoader().parse(e.target.result);
           obj.traverse(c => {
             if (c.isMesh && !c.material)
-              c.material = new THREE.MeshStandardMaterial({ color: 0x2a6080, roughness: 0.55, metalness: 0.3 });
+              c.material = new THREE.MeshStandardMaterial({ color: 0xc8e8f0, roughness: 0.35, metalness: 0.55, emissive: new THREE.Color(0x004466), emissiveIntensity: 0.8 });
           });
           onLoaded(obj);
         } catch(err) { onError(err); }
@@ -1125,7 +1130,7 @@ initOpacityPopovers();
         try {
           const geo = new THREE.STLLoader().parse(e.target.result);
           geo.computeVertexNormals();
-          const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x2a6080, roughness: 0.55, metalness: 0.3, transparent: true, opacity: 0.85 }));
+          const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xc8e8f0, roughness: 0.35, metalness: 0.55, emissive: new THREE.Color(0x004466), emissiveIntensity: 0.8 }));
           mesh.castShadow = true;
           onLoaded(mesh);
         } catch(err) { onError(err); }
@@ -1172,9 +1177,11 @@ initOpacityPopovers();
     const centre = bbox.getCenter(new THREE.Vector3());
     const size   = bbox.getSize(new THREE.Vector3());
 
-    const domW = size.x * 5.5,  domH = size.y * 4,  domD = size.z * 5.5;
-    const ox   = centre.x - domW / 2;
-    const oy   = Math.max(centre.y - domH / 2, -0.5);
+    /* FIX domain: upstream 2× model, downstream 3.5× — asymmetric for realistic wake.
+       This ensures the inlet face (ox) is upstream and the model sits in the middle. */
+    const domW = size.x * 5.5,  domH = size.y * 4.5,  domD = size.z * 5.5;
+    const ox   = centre.x - size.x * 2.0;   // inlet 2× model lengths upstream
+    const oy   = Math.max(centre.y - domH * 0.3, -0.5);  // floor near ground
     const oz   = centre.z - domD / 2;
     const cellW = domW / (FLOW_CX - 1);
     const cellH = domH / (FLOW_CY - 1);
@@ -1286,16 +1293,21 @@ initOpacityPopovers();
   function spawnParticle() {
     const d  = WT.flowDims;
     if (!d) return { x:0, y:1, z:0, age: 0, trail: [], speeds: [] };
-    const x  = d.ox + Math.random() * d.cellW * 2;
-    const y  = d.oy + Math.random() * (d.cy - 1) * d.cellH;
-    const z  = d.oz + Math.random() * (d.cz - 1) * d.cellD;
+    /* FIX: spawn at the upstream (inlet) face of the domain so particles
+       flow THROUGH the model, not beside it.
+       Wind blows in +X, so inlet = ox (left face).
+       Particles are distributed across the full Y×Z cross-section. */
+    const x = d.ox + Math.random() * d.cellW * 1.5;          // inlet strip
+    const y = d.oy + Math.random() * (d.cy - 1) * d.cellH;   // full height
+    const z = d.oz + Math.random() * (d.cz - 1) * d.cellD;   // full depth
     return { x, y, z, age: Math.floor(Math.random() * PARTICLE_MAX_AGE), trail: [], speeds: [] };
   }
 
   function resetParticleWT(p) {
     const d = WT.flowDims;
     if (!d) return;
-    p.x   = d.ox + Math.random() * d.cellW * 2;
+    /* FIX: reset also spawns at inlet face so flow is continuous */
+    p.x   = d.ox + Math.random() * d.cellW * 1.5;
     p.y   = d.oy + Math.random() * (d.cy - 1) * d.cellH;
     p.z   = d.oz + Math.random() * (d.cz - 1) * d.cellD;
     p.age   = 0;
@@ -1765,8 +1777,9 @@ initOpacityPopovers();
   }
 
   function setupArchLights() {
-    const ambient = new THREE.AmbientLight(0x1a1f2e, 3.0);
-    const sun  = new THREE.DirectionalLight(0xffd080, 2.5);
+    /* FIX: boost lights so model is visible */
+    const ambient = new THREE.AmbientLight(0x2a2820, 4.5);   // warmer, brighter
+    const sun  = new THREE.DirectionalLight(0xfff0c8, 4.0);  // strong warm sun
     sun.position.set(50, 80, 40);
     sun.castShadow = true;
     sun.shadow.mapSize.set(1024, 1024);
@@ -1776,9 +1789,9 @@ initOpacityPopovers();
     sun.shadow.camera.right =  100;
     sun.shadow.camera.top   =  100;
     sun.shadow.camera.bottom = -100;
-    const fill = new THREE.DirectionalLight(0x2060a0, 0.8);
+    const fill = new THREE.DirectionalLight(0x6090c0, 1.8);  // stronger fill
     fill.position.set(-40, 20, -50);
-    const rim  = new THREE.DirectionalLight(0xf5a623, 0.5);
+    const rim  = new THREE.DirectionalLight(0xf5a623, 1.8);  // strong amber rim
     rim.position.set(0, -10, 60);
     AS.scene.add(ambient, sun, fill, rim);
   }
@@ -1873,17 +1886,17 @@ initOpacityPopovers();
       mesh.traverse(c => {
         if (!c.isMesh) return;
         c.castShadow = c.receiveShadow = true;
-        if (!c.material) {
-          c.material = new THREE.MeshStandardMaterial({ color: 0x2a4060, roughness: 0.6, metalness: 0.25 });
-        } else {
-          if (c.material.color) c.material.color.multiplyScalar(0.9);
-          c.material.roughness    = Math.max(c.material.roughness || 0.5, 0.4);
-          c.material.transparent  = true;
-          c.material.opacity      = Math.min(c.material.opacity || 1, 0.92);
-          if (!c.material.emissive) c.material.emissive = new THREE.Color(0x0a1428);
-          else c.material.emissive.lerp(new THREE.Color(0x0a1428), 0.4);
-          c.material.emissiveIntensity = 0.3;
-        }
+        /* FIX §19: same visibility fix as §18 — amber-tinted for arch sim theme */
+        const matNew = new THREE.MeshStandardMaterial({
+          color:             0xe8d0a0,   // warm off-white/stone — architectural feel
+          roughness:         0.45,
+          metalness:         0.15,
+          emissive:          new THREE.Color(0x3a2800),
+          emissiveIntensity: 0.6,        // enough glow to read through particle trails
+          transparent:       false,
+        });
+        c.material = matNew;
+        c.material.needsUpdate = true;
       });
 
       AS.scene.add(mesh);
@@ -1941,7 +1954,7 @@ initOpacityPopovers();
           const obj = new THREE.OBJLoader().parse(e.target.result);
           obj.traverse(c => {
             if (c.isMesh && !c.material)
-              c.material = new THREE.MeshStandardMaterial({ color: 0x2a4060, roughness: 0.6, metalness: 0.25 });
+              c.material = new THREE.MeshStandardMaterial({ color: 0xe8d0a0, roughness: 0.45, metalness: 0.15, emissive: new THREE.Color(0x3a2800), emissiveIntensity: 0.6 });
           });
           onLoaded(obj);
         } catch(err) { onError(err); }
@@ -1954,7 +1967,7 @@ initOpacityPopovers();
           const geo = new THREE.STLLoader().parse(e.target.result);
           geo.computeVertexNormals();
           const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-            color: 0x2a4060, roughness: 0.6, metalness: 0.25, transparent: true, opacity: 0.9
+            color: 0xe8d0a0, roughness: 0.45, metalness: 0.15, emissive: new THREE.Color(0x3a2800), emissiveIntensity: 0.6
           }));
           mesh.castShadow = true;
           onLoaded(mesh);
@@ -2035,10 +2048,11 @@ initOpacityPopovers();
     const centre = bbox.getCenter(new THREE.Vector3());
     const size   = bbox.getSize(new THREE.Vector3());
 
+    /* FIX: domain inlet at upstream face, model 35% from inlet (realistic CFD proportions) */
     const domW = size.x * 8;
     const domH = size.y * 5;
     const domD = size.z * 8;
-    const ox   = centre.x - domW * 0.35;
+    const ox   = centre.x - size.x * 2.8;  // inlet 2.8× upstream from model centre
     const oy   = 0;
     const oz   = centre.z - domD / 2;
 
