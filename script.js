@@ -1,22 +1,32 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   FogHarvest  ·  script.js  ·  v7-fixed
+   FogHarvest  ·  script.js  ·  v8-fixed
    ─────────────────────────────────────────────────────────────────────
-   Fixes vs v7:
-   §6   buildUVGrid — corrected UV sign convention:
-        u =  speed * sin(rad)   (east is +canvas-X ✓)
-        v =  speed * cos(rad)   (north is stored positive)
-        §7 particle frame: p.y -= v * scale  (−v because canvas-Y is
-        inverted vs geographic N). Removing the negation in buildUVGrid
-        and keeping the subtraction in the particle loop gives one clean
-        sign flip total — vectors now flow in the correct direction.
-   §18  3D Wind Tunnel — setupDragDrop now wires a click handler on the
-        drop-zone so clicking also opens the file picker (was missing).
-        loadModel() renamed to wtLoadModel() to avoid collision with the
-        now-deleted legacy tunnel block at the bottom of this file.
-   §19  Arch Sim — no changes needed (was already correct).
-   DELETED: the legacy "3D WIND TUNNEL MODEL UPLOAD FIX" block (§20)
-        that used loader.load(blobURL), which silently hangs in THREE
-        r128 and shadowed the IIFE's local loadModel function.
+   All fixes from v7-fixed retained, plus:
+
+   §18  Wind Tunnel (wtLoadModel / updateTransforms / buildFlowField)
+        BUG FIX 1: updateTransforms() now resets position.y=0 BEFORE
+        computing Box3, eliminating the position-feedback loop that
+        compounded Y-offset on repeated slider moves.
+        BUG FIX 4: Removed redundant buildFlowField() call at end of
+        wtLoadModel onLoaded (updateTransforms already calls it).
+        BUG FIX 3: buildFlowField() now reads WT.climate.dir to rotate
+        the dipole flow field — wind direction is actually applied.
+
+   §19  Architecture Sim (archLoadModel / applyRealScale /
+        updateArchTransforms / resetArchSim / buildArchFlowField)
+        BUG FIX 1 (PRIMARY — misalignment root cause):
+        AS.sceneScale now correctly stores the initial normalisation
+        factor `norm` instead of being hardcoded to 1. applyRealScale()
+        resets position and uses AS.sceneScale as the base, preventing
+        the double-scaling that shifted the model off the ground plane.
+        BUG FIX 2: updateArchTransforms() resets position.y=0 BEFORE
+        computing Box3, same feedback-loop fix as §18.
+        BUG FIX 3: buildArchFlowField() applies AS.climate.dir rotation
+        so the dipole field is oriented to real wind direction.
+        BUG FIX 5: resetArchSim() now clears flowGrid, flowDims, and
+        climate so stale data doesn't persist between uploads.
+        BUG FIX 4: Removed redundant buildArchFlowField() call inside
+        archLoadModel onLoaded (applyRealScale already calls it).
 ═══════════════════════════════════════════════════════════════════════ */
 
 
@@ -1083,7 +1093,8 @@ initOpacityPopovers();
         `${file.name} · ${sz2.x.toFixed(2)} × ${sz2.y.toFixed(2)} × ${sz2.z.toFixed(2)} m`;
       document.getElementById('wtModelInfo').classList.remove('hidden');
       showSection('wtPlaceSection');
-      buildFlowField();
+      // FIX BUG 4: removed redundant buildFlowField() call here —
+      // updateTransforms() (called next) already invokes buildFlowField().
       setSimStatus('Modelo listo — ejecuta la simulación', false);
       updateTransforms();
       syncRunButton();
@@ -1148,6 +1159,10 @@ initOpacityPopovers();
     WT.modelMesh.scale.setScalar(scale);
     WT.modelMesh.rotation.y = (rotY * Math.PI) / 180;
 
+    // FIX BUG 2: Reset position to (0,0,0) before measuring bbox so that
+    // the previous position.y doesn't feed back into the new min.y reading,
+    // which would compound the offset with every slider move.
+    WT.modelMesh.position.set(0, 0, 0);
     const b2 = new THREE.Box3().setFromObject(WT.modelMesh);
     WT.modelMesh.position.set(offX, -b2.min.y + offY, offZ);
 
@@ -1187,6 +1202,17 @@ initOpacityPopovers();
     const U = 1.0;
     const A = U * ax * ay * az;
 
+    // FIX BUG 3: derive wind-direction rotation so the free-stream
+    // flows from the correct meteorological direction.
+    // wind_dir = direction FROM which wind comes (CW from N).
+    // In THREE: +X = east, +Z = south. A wind from the west (270°)
+    // should push particles in the +X direction.
+    const windDirDeg = WT.climate ? WT.climate.dir : 270;
+    const windRad    = (windDirDeg * Math.PI) / 180;
+    // Unit vector the wind blows TOWARD (opposite of "from" direction)
+    const windU =  Math.sin(windRad);   // east component
+    const windW =  Math.cos(windRad);   // south component (THREE +Z)
+
     const grid = new Float32Array(FLOW_CX * FLOW_CY * FLOW_CZ * 3);
 
     for (let iz = 0; iz < FLOW_CZ; iz++) {
@@ -1196,21 +1222,32 @@ initOpacityPopovers();
           const wy = oy + iy * cellH;
           const wz = oz + iz * cellD;
 
-          const dx = (wx - cx) / (ax * 1.1);
-          const dy = (wy - cy) / (ay * 1.1);
-          const dz = (wz - cz) / (az * 1.1);
-          const r2 = dx*dx + dy*dy + dz*dz;
+          // Rotate world coords into the wind-aligned frame
+          // (so the dipole "x" axis always aligns with the incoming flow)
+          const lx =  (wx - cx) * windU + (wz - cz) * windW;
+          const ly =   wy - cy;
+          const lz = -(wx - cx) * windW + (wz - cz) * windU;
+
+          const dxN = lx / (ax * 1.1);
+          const dyN = ly / (ay * 1.1);
+          const dzN = lz / (az * 1.1);
+          const r2 = dxN*dxN + dyN*dyN + dzN*dzN;
           const r  = Math.sqrt(r2) || 1e-9;
           const r5 = r2 * r2 * r;
 
-          let u, v, w;
+          let uL, vL, wL;   // velocity in local (wind-aligned) frame
           if (r < 1.0) {
-            u = 0; v = 0; w = 0;
+            uL = 0; vL = 0; wL = 0;
           } else {
-            u =  U * (1 - A * (2*dx*dx - dy*dy - dz*dz) / r5);
-            v = -U *      A * 3 * dx * dy / r5;
-            w = -U *      A * 3 * dx * dz / r5;
+            uL =  U * (1 - A * (2*dxN*dxN - dyN*dyN - dzN*dzN) / r5);
+            vL = -U *      A * 3 * dxN * dyN / r5;
+            wL = -U *      A * 3 * dxN * dzN / r5;
           }
+
+          // Rotate velocity back to world frame
+          const u =  uL * windU - wL * windW;
+          const v =  vL;
+          const w =  uL * windW + wL * windU;
 
           const idx = (iz * FLOW_CY * FLOW_CX + iy * FLOW_CX + ix) * 3;
           grid[idx]   = u;
@@ -1888,7 +1925,11 @@ initOpacityPopovers();
       AS.scene.add(mesh);
       AS.modelMesh  = mesh;
       AS.modelBBox  = new THREE.Box3().setFromObject(mesh);
-      AS.sceneScale = 1;
+      // FIX BUG 1 (PRIMARY): store the actual normalisation factor so
+      // applyRealScale() can use it as a true baseline. Was hardcoded to 1,
+      // which caused applyRealScale to double-scale the model and shift it
+      // off the ground plane — the root cause of the visual misalignment.
+      AS.sceneScale = norm;
 
       const sz  = AS.modelBBox.getSize(new THREE.Vector3());
       const ctr = AS.modelBBox.getCenter(new THREE.Vector3());
@@ -1905,7 +1946,8 @@ initOpacityPopovers();
       AS.controls.update();
 
       buildContextBuildings();
-      buildArchFlowField();
+      // FIX BUG 4: removed redundant buildArchFlowField() call here —
+      // applyRealScale() (called next) already invokes buildArchFlowField().
       applyRealScale();
 
       AS.modelLoaded = true;
@@ -1976,15 +2018,25 @@ initOpacityPopovers();
       return;
     }
 
-    const sz = AS.modelBBox.getSize(new THREE.Vector3());
-    let desiredScale = AS.modelMesh.scale.x;
+    // FIX BUG 1: Reset to the stored normalisation scale and clear position
+    // before measuring the bbox. Without this, sz.y already contains the
+    // result of a previous applyRealScale call, causing desiredScale to be
+    // multiplied onto an already-scaled mesh (double-scaling).
+    const baseScale = AS.sceneScale || 1;
+    AS.modelMesh.scale.setScalar(baseScale);
+    AS.modelMesh.position.set(0, 0, 0);
 
-    if (realH > 0) desiredScale *= realH / sz.y;
-    else if (realW > 0) desiredScale *= realW / Math.max(sz.x, sz.z);
+    const sz = new THREE.Box3().setFromObject(AS.modelMesh).getSize(new THREE.Vector3());
+    let desiredScale = baseScale;
+
+    if (realH > 0) desiredScale = baseScale * (realH / sz.y);
+    else if (realW > 0) desiredScale = baseScale * (realW / Math.max(sz.x, sz.z));
 
     AS.modelMesh.scale.setScalar(desiredScale);
+    // FIX BUG 2 (also applies here): reset before measuring ground offset
+    AS.modelMesh.position.set(0, 0, 0);
     const b = new THREE.Box3().setFromObject(AS.modelMesh);
-    AS.modelMesh.position.y -= b.min.y;
+    AS.modelMesh.position.y = -b.min.y;
     AS.modelBBox = new THREE.Box3().setFromObject(AS.modelMesh);
 
     if (AS.envBox) {
@@ -2014,6 +2066,10 @@ initOpacityPopovers();
     AS.modelMesh.scale.setScalar(scale);
     AS.modelMesh.rotation.y = (rotY * Math.PI) / 180;
 
+    // FIX BUG 2: Reset position.y=0 before measuring the bbox so that
+    // the previous position.y value doesn't feed into b.min.y, which
+    // would compound the vertical offset with every slider move.
+    AS.modelMesh.position.set(0, 0, 0);
     const b = new THREE.Box3().setFromObject(AS.modelMesh);
     AS.modelMesh.position.y = -b.min.y + elevOff;
 
@@ -2051,6 +2107,15 @@ initOpacityPopovers();
     const cx = centre.x, cy = centre.y, cz = centre.z;
     const U  = 1.0, A = U * ax * ay * az;
 
+    // FIX BUG 3: derive wind-direction rotation so the dipole free-stream
+    // aligns with the real meteorological wind direction from climate data.
+    // wind_dir = direction FROM which wind comes (CW from N).
+    // In THREE: +X = east, +Z = south.
+    const windDirDeg = AS.climate ? AS.climate.dir : 270;
+    const windRad    = (windDirDeg * Math.PI) / 180;
+    const windU =  Math.sin(windRad);   // east component of "blows toward"
+    const windW =  Math.cos(windRad);   // south component (THREE +Z)
+
     const grid = new Float32Array(AFC * AFCY * AFCZ * 3);
 
     for (let iz = 0; iz < AFCZ; iz++) {
@@ -2059,6 +2124,11 @@ initOpacityPopovers();
           const wx = ox + ix * cellW;
           const wy = oy + iy * cellH;
           const wz = oz + iz * cellD;
+
+          // Rotate world coords into wind-aligned local frame
+          const lx =  (wx - cx) * windU + (wz - cz) * windW;
+          const ly =   wy - cy;
+          const lz = -(wx - cx) * windW + (wz - cz) * windU;
 
           function dipole(dx, dy, dz) {
             const r2 = dx*dx + dy*dy + dz*dz;
@@ -2071,31 +2141,36 @@ initOpacityPopovers();
             };
           }
 
-          const dxR = (wx - cx) / (ax * 1.12);
-          const dyR = (wy - cy) / (ay * 1.12);
-          const dzR = (wz - cz) / (az * 1.12);
+          const dxR = lx / (ax * 1.12);
+          const dyR = ly / (ay * 1.12);
+          const dzR = lz / (az * 1.12);
           const rR  = Math.sqrt(dxR*dxR + dyR*dyR + dzR*dzR);
 
-          const dxI = (wx - cx)  / (ax * 1.12);
-          const dyI = (wy + cy)  / (ay * 1.12);
-          const dzI = (wz - cz)  / (az * 1.12);
+          const dxI = lx  / (ax * 1.12);
+          const dyI = (ly + cy * 2) / (ay * 1.12);  // image source below ground
+          const dzI = lz  / (az * 1.12);
 
-          let u, v, w;
+          let uL, vL, wL;
           if (rR < 1.0) {
-            u = 0; v = 0; w = 0;
+            uL = 0; vL = 0; wL = 0;
           } else {
             const d1 = dipole(dxR, dyR, dzR);
             const d2 = dipole(dxI, dyI, dzI);
-            u = (d1.u + d2.u) * 0.5;
-            v = (d1.v - d2.v) * 0.5;
-            w = (d1.w + d2.w) * 0.5;
-            u = Math.max(-3, Math.min(3, u));
-            v = Math.max(-3, Math.min(3, v));
-            w = Math.max(-3, Math.min(3, w));
+            uL = (d1.u + d2.u) * 0.5;
+            vL = (d1.v - d2.v) * 0.5;
+            wL = (d1.w + d2.w) * 0.5;
+            uL = Math.max(-3, Math.min(3, uL));
+            vL = Math.max(-3, Math.min(3, vL));
+            wL = Math.max(-3, Math.min(3, wL));
           }
 
           const groundDamp = Math.min(1, wy / Math.max(0.5, ay * 0.3));
-          v *= groundDamp;
+          vL *= groundDamp;
+
+          // Rotate velocity back to world frame
+          const u =  uL * windU - wL * windW;
+          const v =  vL;
+          const w =  uL * windW + wL * windU;
 
           const idx = (iz * AFCY * AFC + iy * AFC + ix) * 3;
           grid[idx]   = u;
@@ -2398,8 +2473,14 @@ initOpacityPopovers();
 
   function resetArchSim() {
     stopArchSim();
-    if (AS.particleSys) { AS.scene.remove(AS.particleSys); AS.particleSys = null; }
+    if (AS.particleSys)  { AS.scene.remove(AS.particleSys);  AS.particleSys  = null; }
     if (AS.pressureMesh) { AS.scene.remove(AS.pressureMesh); AS.pressureMesh = null; }
+    // FIX BUG 5: clear flow state and climate so a subsequent model upload
+    // or re-run does not inherit stale data from the previous simulation.
+    AS.flowGrid  = null;
+    AS.flowDims  = null;
+    AS.particles = null;
+    AS.climate   = null;
     document.getElementById('archResultsSection').classList.add('arch-results-hidden');
     setArchStatus('RESET', 'idle');
     archAnimate();
@@ -2656,8 +2737,6 @@ initOpacityPopovers();
 
 })();
 /* ═══════════════════════════════════════════════════════════════════════
-   END OF script.js  ·  FogHarvest v7-fixed
-   Legacy "3D WIND TUNNEL MODEL UPLOAD FIX" block removed.
-   That block used loader.load(blobURL) which hangs in THREE r128 and
-   defined a global loadModel() that shadowed the IIFE's local version.
+   END OF script.js  ·  FogHarvest v8-fixed
+   All 5 simulation bugs fixed. See file header for full changelog.
 ═══════════════════════════════════════════════════════════════════════ */
