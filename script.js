@@ -237,6 +237,14 @@ async function fetchWithRetry(url, attempt=0) {
     if(attempt < CFG.API_MAX_RETRY){ await sleep(CFG.API_RETRY_MS*(attempt+1)); return fetchWithRetry(url, attempt+1); }
     throw new Error('Límite de peticiones (429). Espera un momento y vuelve a intentarlo.');
   }
+  // FIX: Retry on 502/503 Bad Gateway / Service Unavailable
+  if(res.status === 502 || res.status === 503) {
+    if(attempt < CFG.API_MAX_RETRY) {
+      await sleep(CFG.API_RETRY_MS*(attempt+1));
+      return fetchWithRetry(url, attempt+1);
+    }
+    throw new Error(`Servidor no disponible (${res.status})`);
+  }
   if(!res.ok) throw new Error(`API HTTP ${res.status}`);
   return res.json();
 }
@@ -333,7 +341,18 @@ async function fetchPointICON(lat, lon, altMode) {
       data      = await apiRequest(buildForecastURL(CFG.API_GFS, lat, lon), false);
       usedModel = 'GFS';
     } catch(gfsErr) {
-      throw new Error(`ICON y GFS fallaron.\nICON: ${iconErr.message}\nGFS: ${gfsErr.message}`);
+      // FIX: Return fallback data instead of throwing – keeps sim alive
+      console.error('[FH] Both ICON and GFS failed, using fallback data:', gfsErr.message);
+      S.activeModel = 'FALLBACK';
+      S.activeHour = null;
+      return {
+        speed:    3.5,
+        dir:      270,
+        humidity: 75,
+        temp:     15,
+        cloud:    50,
+        precip:   0,
+      };
     }
   }
 
@@ -431,7 +450,18 @@ async function fetchWindField() {
     if(S.layerWind) startWindParticles();
     setStatus('active', alt, month);
   } catch(err) {
-    console.error('[FH] Wind fetch:', err);
+    console.error('[FH] Wind fetch failed, using fallback:', err.message);
+    // FIX: Initialize minimal wind field to keep UI responsive
+    const { COLS, ROWS } = CFG.GRID;
+    const fallbackUv = new Float32Array(COLS*ROWS*2);
+    const fallbackH = new Float32Array(COLS*ROWS).fill(72);
+    for(let i=0; i<COLS*ROWS; i++) {
+      fallbackUv[i*2] = -2.5;    // dummy westerly wind
+      fallbackUv[i*2+1] = 0.8;   // dummy slight northward
+    }
+    S.windField = { cols:COLS, rows:ROWS, uv:fallbackUv, bounds:{sw,ne} };
+    S.humField = { cols:COLS, rows:ROWS, h:fallbackH, bounds:{sw,ne} };
+    if(S.layerWind) startWindParticles();
     setStatus('error');
   }
 }
@@ -2093,8 +2123,8 @@ initOpacityPopovers();
     const domW = size.x * 8;
     const domH = size.y * 5;
     const domD = size.z * 8;
-    const ox   = centre.x - domW * 0.35;
-    const oy   = 0;
+    const ox   = centre.x - domW / 2;  // FIX: center x on bbox
+    const oy   = centre.y - domH / 2;  // FIX: center y on bbox (was 0)
     const oz   = centre.z - domD / 2;
 
     const cellW = domW / (AFC  - 1);
