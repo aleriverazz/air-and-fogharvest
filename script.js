@@ -46,8 +46,8 @@ const CFG = {
   TERRAIN_EXG: 1.5,
 
   /* ── Weather API endpoints ───────────────────────── */
-  API_ICON:    'https://api.open-meteo.com/v1/icon',
-  API_GFS:     'https://api.open-meteo.com/v1/gfs',
+  API_ICON:    'https://api.open-meteo.com/v1/forecast',
+API_GFS:     'https://api.open-meteo.com/v1/forecast',
   API_ARCHIVE: 'https://archive-api.open-meteo.com/v1/archive',
 
   HOURLY_VARS: [
@@ -78,8 +78,8 @@ const CFG = {
   GRID: { COLS: 14, ROWS: 10 },
 
   API_DELAY_MS:  1200,
-  API_RETRY_MS:  4000,
-  API_MAX_RETRY: 2,
+  API_RETRY_MS:  2000,   // FIX: base for exponential backoff (2000 → 4000 → 8000 ms)
+  API_MAX_RETRY: 3,      // FIX: was 2
 
   WIND: {
     PARTICLE_COUNT: 2200,
@@ -106,6 +106,23 @@ const CFG = {
 
 
 /* ══════════════════════════════════════════════════════
+   1b. WebGL2 DETECTION
+══════════════════════════════════════════════════════ */
+const HAS_WEBGL2 = (() => {
+  try {
+    const c = document.createElement('canvas');
+    return !!(c.getContext('webgl2') || c.getContext('experimental-webgl2'));
+  } catch(e) { return false; }
+})();
+if (!HAS_WEBGL2) {
+  console.warn('[FH] WebGL2 not available — 3D tunnels will use reduced quality or be disabled');
+}
+// Reduce particle counts when WebGL2 is absent (less GPU stress)
+if (!HAS_WEBGL2) {
+  CFG.WIND.PARTICLE_COUNT = 400;
+}
+
+/* ══════════════════════════════════════════════════════
    2. STATE
 ══════════════════════════════════════════════════════ */
 const S = {
@@ -120,6 +137,8 @@ const S = {
   monthChart:null, panelOpen:true, searchTimer:null,
   apiCache:  new Map(),
   apiQueue:  Promise.resolve(),
+  domainQueues: new Map(), // FIX: per-domain throttle queues (min 500 ms between requests)
+  requestLog:   [],        // FIX: global rate-limit counter — timestamps of last 60 s
 
   activeModel: 'ICON',
   activeHour:  null,
@@ -129,16 +148,98 @@ const S = {
 /* ══════════════════════════════════════════════════════
    3. MAP INIT
 ══════════════════════════════════════════════════════ */
+
+// Leaflet OSM fallback — used when MapTiler key is invalid or style fails to load
+function initLeafletFallback() {
+  console.warn('[FH] MapTiler failed — falling back to Leaflet/OSM');
+  const mapDiv = document.getElementById('map');
+  mapDiv.style.position = 'absolute';
+  mapDiv.style.inset = '0';
+  const lmap = L.map('map').setView([CFG.CENTER[1], CFG.CENTER[0]], Math.round(CFG.ZOOM));
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors',
+    maxZoom: 19,
+  }).addTo(lmap);
+  // Wrap Leaflet as a minimal S.map duck-type
+  S.map = {
+    _lmap: lmap,
+    isStyleLoaded: () => true,
+    getBounds: () => {
+      const b = lmap.getBounds();
+      return { getSouthWest: () => ({ lat: b.getSouth(), lng: b.getWest() }),
+               getNorthEast: () => ({ lat: b.getNorth(), lng: b.getEast() }) };
+    },
+    getCenter: () => { const c = lmap.getCenter(); return { lat: c.lat, lng: c.lng }; },
+    getZoom: () => lmap.getZoom(),
+    getCanvas: () => mapDiv,
+    resize: () => lmap.invalidateSize(),
+    on: (evt, cb) => {
+      if (evt === 'load') { cb(); return; }
+      if (evt === 'moveend') lmap.on('moveend', cb);
+      if (evt === 'click')   lmap.on('click', e => cb({ lngLat: { lat: e.latlng.lat, lng: e.latlng.lng } }));
+    },
+    addControl: () => {},
+    addSource: () => {},
+    setTerrain: () => {},
+    addLayer: () => {},
+    getSource: () => null,
+    getLayer: () => null,
+    flyTo: (o) => lmap.flyTo([o.center[1], o.center[0]], o.zoom || lmap.getZoom()),
+    _leaflet: true,
+  };
+  lmap.on('moveend', debounce(fetchWindField, 1200));
+  lmap.on('click', e => onMapClick(e.latlng.lat, e.latlng.lng));
+  mapDiv.style.cursor = 'crosshair';
+  initCanvases();
+  fetchWindField();
+  showApp();
+}
+
 function initMap() {
   maptilersdk.config.apiKey = CFG.MT_KEY;
-  S.map = new maptilersdk.Map({
-    container:'map', style:CFG.MT_STYLE,
-    center:CFG.CENTER, zoom:CFG.ZOOM, pitch:CFG.PITCH, bearing:CFG.BEARING,
-    antialias:true,
-  });
+  let mapLoadFailed = false;
+
+  // Try to use browser geolocation to center the map on user location
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(pos => {
+      if (S.map && !S.map._leaflet) {
+        try { S.map.flyTo({ center: [pos.coords.longitude, pos.coords.latitude], zoom: CFG.ZOOM }); } catch(e){}
+      }
+    }, () => {/* denied — use default center */});
+  }
+
+  try {
+    S.map = new maptilersdk.Map({
+      container:'map', style:CFG.MT_STYLE,
+      center:CFG.CENTER, zoom:CFG.ZOOM, pitch:CFG.PITCH, bearing:CFG.BEARING,
+      antialias:true,
+    });
+  } catch(e) {
+    console.error('[FH] MapTiler Map() threw:', e);
+    initLeafletFallback();
+    return;
+  }
+
   S.map.addControl(new maptilersdk.NavigationControl({ visualizePitch:true }), 'bottom-right');
-  const _t = setTimeout(()=>{ initCanvases(); showApp(); }, 10000);
+
+  // Timeout fallback: if map never fires 'load' in 8 s, switch to Leaflet
+  const _t = setTimeout(() => {
+    if (!mapLoadFailed) { mapLoadFailed = true; initLeafletFallback(); }
+  }, 8000);
+
+  S.map.on('error', e => {
+    console.warn('[FH] MapTiler error:', e?.error?.message || e);
+    // Key invalid (401/403) → fallback immediately
+    const msg = (e?.error?.message || '').toLowerCase();
+    if ((msg.includes('401') || msg.includes('403') || msg.includes('unauthorized')) && !mapLoadFailed) {
+      mapLoadFailed = true;
+      clearTimeout(_t);
+      initLeafletFallback();
+    }
+  });
+
   S.map.on('load', () => {
+    if (mapLoadFailed) return;
     clearTimeout(_t);
     try { if(!S.map.getSource('mt-dem')) S.map.addSource('mt-dem', { type:'raster-dem', url:CFG.MT_TERRAIN_URL, tileSize:512, maxzoom:14 }); } catch(e){}
     try { S.map.setTerrain({ source:'mt-dem', exaggeration:CFG.TERRAIN_EXG }); } catch(e){}
@@ -147,7 +248,7 @@ function initMap() {
     fetchWindField();
     showApp();
   });
-  S.map.on('error', e => { console.warn('[FH]', e?.error?.message||e); });
+
   S.map.on('click', e => onMapClick(e.lngLat.lat, e.lngLat.lng));
   S.map.getCanvas().style.cursor = 'crosshair';
   S.map.on('moveend', debounce(fetchWindField, 1200));
@@ -217,35 +318,107 @@ function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/
 /* ══════════════════════════════════════════════════════
    5. RATE-LIMITED API
 ══════════════════════════════════════════════════════ */
-function apiRequest(url, isArchive=false) {
-  if(S.apiCache.has(url)) return Promise.resolve(S.apiCache.get(url));
-  if(!isArchive) {
-    return fetchWithRetry(url).then(d => { S.apiCache.set(url,d); return d; });
+
+/* FIX: Returns hostname of a URL for per-domain throttling */
+function getDomain(url) {
+  try { return new URL(url).hostname; } catch { return url; }
+}
+
+/* FIX: Enforce minimum 500 ms gap between requests to the same domain */
+function domainThrottle(url) {
+  const domain = getDomain(url);
+  const prev   = S.domainQueues.get(domain) || Promise.resolve();
+  const next   = prev.then(() => sleep(500));
+  S.domainQueues.set(domain, next.then(() => {}));
+  return next;
+}
+
+/* FIX: Global rate-limit guard — if >50 requests in last 60 s, wait */
+async function globalRateGuard() {
+  const now    = Date.now();
+  const window = 60_000;
+  S.requestLog = S.requestLog.filter(t => now - t < window);
+  if (S.requestLog.length >= 50) {
+    const oldest = S.requestLog[0];
+    const waitMs = window - (now - oldest) + 50;
+    console.warn(`[FH] Global rate limit reached — waiting ${waitMs} ms`);
+    await sleep(waitMs);
+    S.requestLog = S.requestLog.filter(t => Date.now() - t < window);
   }
-  S.apiQueue = S.apiQueue.then(() => sleep(CFG.API_DELAY_MS));
+  S.requestLog.push(Date.now());
+}
+
+/* FIX: Cache-aware fetch with 5-minute TTL.
+        On 429, returns stale cached data if available. */
+async function getCachedOrFetch(url, { staleKey = null, forceFresh = false } = {}) {
+  const CACHE_TTL = 5 * 60 * 1000; // FIX: 5-minute expiry for weather data
+  const now       = Date.now();
+  const key       = staleKey || url;
+
+  if (!forceFresh && S.apiCache.has(key)) {
+    const entry = S.apiCache.get(key);
+    if (now - entry.ts < CACHE_TTL) {
+      return entry.data; // FIX: return fresh cached data within TTL
+    }
+    // FIX: stale entry exists — try fresh fetch, fall back to stale on 429
+  }
+
+  try {
+    await globalRateGuard();      // FIX: check global 50 req/min cap
+    await domainThrottle(url);    // FIX: per-domain 500 ms spacing
+    const data = await fetchWithRetry(url);
+    S.apiCache.set(key, { data, ts: now }); // FIX: store with timestamp for TTL
+    return data;
+  } catch (err) {
+    // FIX: on 429 after retries exhausted, return stale cache if available
+    if (err.message.includes('429') && S.apiCache.has(key)) {
+      console.warn('[FH] 429 — serving stale cache for', key);
+      return S.apiCache.get(key).data;
+    }
+    throw err;
+  }
+}
+
+/* FIX: Delegates to getCachedOrFetch; per-domain throttle for all requests */
+function apiRequest(url, isArchive = false) {
+  if (!isArchive) {
+    return getCachedOrFetch(url); // FIX: non-archive goes direct
+  }
+  // FIX: archive requests serialised through global queue
   return new Promise((resolve, reject) => {
     S.apiQueue = S.apiQueue.then(async () => {
-      try { const d=await fetchWithRetry(url); S.apiCache.set(url,d); resolve(d); }
-      catch(e){ reject(e); }
+      try   { resolve(await getCachedOrFetch(url)); }
+      catch (e) { reject(e); }
     });
   });
 }
 
-async function fetchWithRetry(url, attempt=0) {
+/* FIX: Exponential backoff on 429 — 2000, 4000, 8000 ms (base * 2^attempt) */
+async function fetchWithRetry(url, attempt = 0) {
   const res = await fetch(url);
-  if(res.status === 429) {
-    if(attempt < CFG.API_MAX_RETRY){ await sleep(CFG.API_RETRY_MS*(attempt+1)); return fetchWithRetry(url, attempt+1); }
-    throw new Error('Límite de peticiones (429). Espera un momento y vuelve a intentarlo.');
+
+  if (res.status === 429) {
+    if (attempt < CFG.API_MAX_RETRY) {
+      const delay = CFG.API_RETRY_MS * Math.pow(2, attempt); // FIX: exponential backoff
+      console.warn(`[FH] 429 — retry ${attempt + 1}/${CFG.API_MAX_RETRY} in ${delay} ms`);
+      await sleep(delay);
+      return fetchWithRetry(url, attempt + 1);
+    }
+    throw new Error(`429: Límite de peticiones. Espera un momento y vuelve a intentarlo.`);
   }
-  // FIX: Retry on 502/503 Bad Gateway / Service Unavailable
-  if(res.status === 502 || res.status === 503) {
-    if(attempt < CFG.API_MAX_RETRY) {
-      await sleep(CFG.API_RETRY_MS*(attempt+1));
-      return fetchWithRetry(url, attempt+1);
+
+  // FIX: retry on 502/503 with same exponential backoff
+  if (res.status === 502 || res.status === 503) {
+    if (attempt < CFG.API_MAX_RETRY) {
+      const delay = CFG.API_RETRY_MS * Math.pow(2, attempt);
+      console.warn(`[FH] ${res.status} — retry ${attempt + 1}/${CFG.API_MAX_RETRY} in ${delay} ms`);
+      await sleep(delay);
+      return fetchWithRetry(url, attempt + 1);
     }
     throw new Error(`Servidor no disponible (${res.status})`);
   }
-  if(!res.ok) throw new Error(`API HTTP ${res.status}`);
+
+  if (!res.ok) throw new Error(`API HTTP ${res.status}`);
   return res.json();
 }
 
@@ -330,23 +503,41 @@ function extractHourlyPoint(data, altMode) {
 }
 
 async function fetchPointICON(lat, lon, altMode) {
+  // FIX: stable cache key for this location+altitude — survives URL changes
+  const cacheKey    = `icon:${lat.toFixed(4)}:${lon.toFixed(4)}:${altMode}`;
+  const gfsCacheKey = `gfs:${lat.toFixed(4)}:${lon.toFixed(4)}:${altMode}`;
+  const iconURL     = buildForecastURL(CFG.API_ICON, lat, lon);
+  const gfsURL      = buildForecastURL(CFG.API_GFS,  lat, lon);
+
   let data, usedModel;
 
+  // ── Try ICON ──────────────────────────────────────────
   try {
-    data      = await apiRequest(buildForecastURL(CFG.API_ICON, lat, lon), false);
+    data      = await getCachedOrFetch(iconURL, { staleKey: cacheKey });
     usedModel = 'ICON';
-  } catch(iconErr) {
+  } catch (iconErr) {
     console.warn('[FH] ICON failed — trying GFS:', iconErr.message);
+
+    // ── Try GFS ─────────────────────────────────────────
     try {
-      data      = await apiRequest(buildForecastURL(CFG.API_GFS, lat, lon), false);
+      data      = await getCachedOrFetch(gfsURL, { staleKey: gfsCacheKey });
       usedModel = 'GFS';
-    } catch(gfsErr) {
-      // FIX: Return fallback data instead of throwing – keeps sim alive
-      console.error('[FH] Both ICON and GFS failed, using fallback data:', gfsErr.message);
+    } catch (gfsErr) {
+      // FIX: 429 after retries — return last valid stale cache for this point
+      const staleEntry = S.apiCache.get(cacheKey) || S.apiCache.get(gfsCacheKey);
+      if (staleEntry) {
+        console.warn('[FH] 429 exhausted — returning stale cache for', cacheKey);
+        S.activeModel = 'STALE';
+        S.activeHour  = null;
+        return extractHourlyPoint(staleEntry.data, altMode); // FIX: re-extract from stale payload
+      }
+
+      // FIX: no cache at all — return safe dummy data so the UI stays alive
+      console.error('[FH] Both ICON and GFS failed, no cache — using dummy data:', gfsErr.message);
       S.activeModel = 'FALLBACK';
-      S.activeHour = null;
+      S.activeHour  = null;
       return {
-        speed:    3.5,
+        speed:    4.0,   // FIX: dummy defaults (speed 4.0, dir 270, humidity 75, temp 15)
         dir:      270,
         humidity: 75,
         temp:     15,
@@ -356,10 +547,15 @@ async function fetchPointICON(lat, lon, altMode) {
     }
   }
 
-  const result = extractHourlyPoint(data, altMode);
-
+  const result  = extractHourlyPoint(data, altMode);
   S.activeModel = usedModel;
   S.activeHour  = result.timeISO;
+
+  // FIX: persist fresh result under stable key for future stale-cache use
+  S.apiCache.set(
+    usedModel === 'ICON' ? cacheKey : gfsCacheKey,
+    { data, ts: Date.now() }
+  );
 
   console.log(
     `[FH] ${usedModel} idx=${result.idx} ` +
@@ -948,7 +1144,7 @@ initOpacityPopovers();
     modelBBox: null,
     particlePositions: null,
     particleTrails:    null,
-    particleCount: 2500,
+    particleCount: 800,
     climate: null,
     simRunning: false,
     modelLoaded: false,
@@ -993,10 +1189,22 @@ initOpacityPopovers();
 
   function setupRenderer() {
     const canvas = document.getElementById('wt-canvas');
-    WT.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-    WT.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    try {
+      WT.renderer = new THREE.WebGLRenderer({
+        canvas, antialias: HAS_WEBGL2,
+        alpha: false,
+        powerPreference: 'default',
+        failIfMajorPerformanceCaveat: false,
+      });
+    } catch(e) {
+      console.error('[FH] WT WebGLRenderer failed:', e);
+      const status = document.getElementById('wt-sim-status');
+      if (status) { status.textContent = 'WebGL not available in this browser'; status.classList.remove('wt-status-hidden'); }
+      return;
+    }
+    WT.renderer.setPixelRatio(Math.min(window.devicePixelRatio, HAS_WEBGL2 ? 2 : 1));
     WT.renderer.setClearColor(0x07090f, 1);
-    WT.renderer.shadowMap.enabled = true;
+    WT.renderer.shadowMap.enabled = HAS_WEBGL2;
     resizeRenderer();
     window.addEventListener('resize', resizeRenderer);
   }
@@ -1746,7 +1954,7 @@ initOpacityPopovers();
     particles:    null,
     trailBuf:     null,
     colorBuf:     null,
-    particleCount: 3000,
+    particleCount: 800,
     climate: null,
     location: null,
     realHeight: null,
@@ -1796,10 +2004,22 @@ initOpacityPopovers();
 
   function setupArchRenderer() {
     const canvas = document.getElementById('arch-canvas');
-    AS.renderer  = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-    AS.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    try {
+      AS.renderer = new THREE.WebGLRenderer({
+        canvas, antialias: HAS_WEBGL2,
+        alpha: false,
+        powerPreference: 'default',
+        failIfMajorPerformanceCaveat: false,
+      });
+    } catch(e) {
+      console.error('[FH] AS WebGLRenderer failed:', e);
+      const hud = document.getElementById('archHudModel');
+      if (hud) hud.textContent = 'WebGL unavailable';
+      return;
+    }
+    AS.renderer.setPixelRatio(Math.min(window.devicePixelRatio, HAS_WEBGL2 ? 2 : 1));
     AS.renderer.setClearColor(0x050709, 1);
-    AS.renderer.shadowMap.enabled = true;
+    AS.renderer.shadowMap.enabled = HAS_WEBGL2;
     AS.renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
     archResizeRenderer();
     window.addEventListener('resize', archResizeRenderer);
